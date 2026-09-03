@@ -1,0 +1,16 @@
+# never commit credentials
+.infoblox_key
+*.key
+*.pem
+.env
+
+# script run output — contains tenant object ids
+ha-move-report.csv
+*-report.csv
+
+__pycache__/
+*.pyc
+.DS_Store
+
+# local test data — tenant-specific, not for the repo
+test/
