@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Move subnets and DHCP ranges from one DHCP HA group to another.
+Move subnets and DHCP ranges from one DHCP host or HA group to another.
 
 Infoblox Universal DDI (Infoblox Portal / csp.infoblox.com).
 
@@ -14,7 +14,11 @@ Runs in DRY-RUN by default: it shows exactly what it would change and writes a
 CSV report, but sends no writes. Add --apply to actually make the changes. A run
 that finds nothing, or that stops at the IP-space precheck, writes no report.
 
-Before writing anything it runs a same-IP-space precheck. HA groups are bound to
+A subnet's dhcp_host holds either an HA group or one DHCP host, so --old and
+--new take either. The kind is worked out from the name, and from the collection
+prefix when an id is given.
+
+Before writing anything it runs a same-IP-space precheck. A target is bound to
 an IP space and the server rejects any subnet whose space does not match, but
 the portal's picker does NOT filter on this - it offers every HA group in the
 tenant and only fails at save time. Checking once up front avoids discovering
@@ -28,6 +32,7 @@ import argparse
 import csv
 import json
 import os
+import re
 import ssl
 import sys
 import time
@@ -38,6 +43,7 @@ import urllib.request
 BASE = "https://csp.infoblox.com/api/ddi/v1"
 PAGE = 1000
 ENV_VAR = "INFOBLOX_API_KEY"
+REPORT_DEFAULT = "ha-move-report.csv"
 
 
 # ---------------------------------------------------------------- transport
@@ -132,6 +138,21 @@ def patch_dhcp_host(collection, obj_id, new_host, key):
 # ---------------------------------------------------------------- lookups
 
 HA_FIELDS = "id,name,mode,ip_space"
+HOST_FIELDS = "id,name,ip_space,type"
+
+# The two things a dhcp_host value can point at. An HA group is the usual
+# target; a DHCP host is one host running the DHCP service, which is what a site
+# has before anyone builds a pair for it. Both answer to the same field, so both
+# belong on --old and --new.
+#
+# "DHCP host" is Infoblox's own word for the dhcp/host collection, and it is not
+# the same list as the appliances under infra/host. In one lab tenant dhcp/host
+# held 167 rows against 101 there, so do not treat either as a subset of the
+# other.
+COLLECTIONS = (
+    ("dhcp/ha_group", "HA group", HA_FIELDS),
+    ("dhcp/host", "DHCP host", HOST_FIELDS),
+)
 
 
 def q(value):
@@ -146,33 +167,60 @@ def q(value):
     return '"%s"' % str(value).replace('"', '""')
 
 
-def find_ha_group(name, key):
-    """Look up one HA group by name. Raises if there is not exactly one."""
-    flt = 'name==%s' % q(name)
-    rows = get_all("/dhcp/ha_group", key, HA_FIELDS, {"_filter": flt})
-    if not rows:
+def _find_named(collection, fields, name, key):
+    """Every object in one collection with this exact name."""
+    return get_all("/" + collection, key, fields, {"_filter": "name==%s" % q(name)})
+
+
+def find_target(name, key):
+    """Look up one HA group, or one DHCP host, by name.
+
+    Auto-detect rather than a second flag. Whoever runs this reads a name off a
+    subnet and does not necessarily know which kind of thing owns it. Both
+    collections are searched. A name that exists in both is refused rather than
+    guessed at, because picking the wrong one moves live DHCP to the wrong place.
+    """
+    hits = []
+    for collection, kind, fields in COLLECTIONS:
+        for row in _find_named(collection, fields, name, key):
+            row["kind"] = kind
+            hits.append(row)
+    if not hits:
         raise ApiError(
-            'No HA group named "%s". Run with --list-ha-groups to see the names.' % name)
-    if len(rows) > 1:
-        raise ApiError('More than one HA group named "%s" - use --old-id/--new-id.' % name)
-    return rows[0]
+            'Nothing named "%s". Run --list-ha-groups and --list-hosts to see '
+            'the names.' % name)
+    if len(hits) > 1:
+        found = ", ".join("%s %s" % (h["kind"], h["id"]) for h in hits)
+        raise ApiError(
+            'More than one thing named "%s": %s. Use --old-id/--new-id to say '
+            'which.' % (name, found))
+    return hits[0]
 
 
-def find_ha_group_by_id(group_id, key):
-    """Fetch one HA group by resource id, e.g. dhcp/ha_group/<uuid>."""
-    uuid = group_id.rsplit("/", 1)[-1]
-    url = "%s/dhcp/ha_group/%s?%s" % (
-        BASE, uuid, urllib.parse.urlencode({"_fields": HA_FIELDS}))
-    _, payload = _request("GET", url, key)
-    row = payload.get("result") or {}
-    if not row:
-        raise ApiError("No HA group with id %s" % group_id)
-    return row
+def find_by_id(res_id, key):
+    """Fetch one HA group, or one DHCP host, by resource id.
+
+    The id says which collection it lives in - dhcp/ha_group/<uuid> against
+    dhcp/host/<number> - so there is nothing to detect here.
+    """
+    for collection, kind, fields in COLLECTIONS:
+        if res_id.startswith(collection + "/"):
+            ident = res_id.rsplit("/", 1)[-1]
+            url = "%s/%s/%s?%s" % (BASE, collection, ident,
+                                   urllib.parse.urlencode({"_fields": fields}))
+            _, payload = _request("GET", url, key)
+            row = payload.get("result") or {}
+            if not row:
+                raise ApiError("No %s with id %s" % (kind, res_id))
+            row["kind"] = kind
+            return row
+    raise ApiError('Unrecognised id "%s". Expected dhcp/ha_group/<uuid> or '
+                   'dhcp/host/<id>.' % res_id)
 
 
-def resolve_group(name, group_id, key):
-    """Take whichever of name or id was given and return the group."""
-    return find_ha_group_by_id(group_id, key) if group_id else find_ha_group(name, key)
+def resolve_target(name, res_id, key):
+    """Take whichever of name or id was given and return the group or host."""
+    return find_by_id(res_id, key) if res_id else find_target(name, key)
 
 
 def list_ha_groups(key):
@@ -180,6 +228,25 @@ def list_ha_groups(key):
     rows = get_all("/dhcp/ha_group", key, HA_FIELDS)
     rows.sort(key=lambda r: (r.get("name") or "").lower())
     return rows
+
+
+def list_hosts(key):
+    """Every DHCP host in the tenant, for --list-hosts."""
+    rows = get_all("/dhcp/host", key, HOST_FIELDS)
+    rows.sort(key=lambda r: (r.get("name") or "").lower())
+    return rows
+
+
+def find_space(name, key):
+    """Look up one IP space by name, or take a resource id as given."""
+    if name.startswith("ipam/ip_space/"):
+        return name
+    rows = get_all("/ipam/ip_space", key, "id,name", {"_filter": "name==%s" % q(name)})
+    if not rows:
+        raise ApiError('No IP space named "%s".' % name)
+    if len(rows) > 1:
+        raise ApiError('More than one IP space named "%s". Give the resource id.' % name)
+    return rows[0]["id"]
 
 
 def space_names(key):
@@ -194,12 +261,17 @@ def space_names(key):
 # ---------------------------------------------------------------- planning
 
 def _server_filter(old_id):
-    """Build a server-side _filter expression for objects on one HA group."""
+    """Build a server-side _filter expression for objects on one group or server."""
     return "dhcp_host==%s" % q(old_id)
 
 
-def build_plan(old_id, key, max_changes=None):
+def build_plan(old_id, key, max_changes=None, space_id=None, cidrs=None):
     """Return (subnets, ranges) that currently point at old_id.
+
+    space_id and cidrs narrow that set. Without them the answer is everything on
+    old_id, which is right for retiring a group and wrong for the far commoner
+    job of moving one site. --max caps a count but chooses for you; these two say
+    which. Narrowing happens before the cap, so --max counts what is left.
 
     Asks the server to filter on dhcp_host. That turns
     a full walk of every subnet and range in the tenant into one small request -
@@ -232,10 +304,29 @@ def build_plan(old_id, key, max_changes=None):
     def keep(o):
         if o.get("dhcp_host") != old_id:
             return False
+        if space_id and o.get("space") != space_id:
+            return False
         return True
 
     s = [o for o in subnets if keep(o)]
     r = [o for o in ranges if keep(o)]
+
+    if cidrs:
+        wanted = set(cidrs)
+        s = [o for o in s if "%s/%s" % (o.get("address"), o.get("cidr")) in wanted]
+        # A typo here would otherwise read as "nothing to do" and exit 0, which
+        # looks exactly like a finished job.
+        missing = sorted(wanted - set("%s/%s" % (o.get("address"), o.get("cidr"))
+                                      for o in s))
+        if missing:
+            raise ApiError(
+                "These --subnet values are not on that source: %s. Check the "
+                "spelling, and that they still point at it." % ", ".join(missing))
+        # A range goes only if its own subnet goes. Naming a subnet and leaving
+        # its ranges behind is the mistake this whole tool exists to stop.
+        parents = set(o["id"] for o in s)
+        r = [o for o in r if o.get("parent") in parents]
+
     if max_changes is not None:
         s, r = _cap(s, r, max_changes)
     return s, r
@@ -283,7 +374,7 @@ def find_unassigned_ranges(subnets, key, max_lookups=200):
     range serves leases only when its own dhcp_host is set, so a null one is not
     quietly inheriting the subnet's group, it is serving nothing.
 
-    Nothing in the tenant points these at the old HA group, so build_plan() cannot
+    Nothing in the tenant points these at the old target, so build_plan() cannot
     see them, and this tool does not change them.
 
     They matter because subnet and range assignments are independent in Universal
@@ -314,7 +405,7 @@ def find_unassigned_ranges(subnets, key, max_lookups=200):
 
 
 def check_spaces(objects, target_space):
-    """Split objects into (compatible, incompatible) against the target HA group's
+    """Split objects into (compatible, incompatible) against the target's
     IP space. If the group reports no ip_space, everything passes - we do not have
     enough information to judge, and the server remains the authority."""
     if not target_space:
@@ -334,13 +425,202 @@ def describe(kind, o):
 
 def write_report(path, rows):
     """Write the per-object CSV: one row per object, with its result."""
-    cols = ["object_type", "id", "label", "name", "space",
+    cols = ["object_type", "id", "parent_id", "label", "name", "space",
             "current_dhcp_host", "new_dhcp_host", "action", "result"]
     with open(path, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=cols)
         w.writeheader()
         for row in rows:
             w.writerow(row)
+
+
+def _looks_like_cidr(value):
+    """True for an IPv4 address and prefix. Checks the numbers, not the shape.
+
+    A shape test alone passes 999.999.999.999/99, which then reads as a subnet
+    that is simply not on the source - a wrong answer dressed as a real one.
+    """
+    m = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})$", value)
+    if not m:
+        return False
+    octets = [int(g) for g in m.groups()[:4]]
+    return all(o <= 255 for o in octets) and int(m.group(5)) <= 32
+
+
+def _why_narrowed(args):
+    """The flags that explain why a run left objects behind."""
+    bits = []
+    if args.max is not None:
+        bits.append("--max")
+    if args.space:
+        bits.append("--space")
+    if args.subnet:
+        bits.append("--subnet")
+    return ", ".join(bits)
+
+
+def _narrowing(args, space_label):
+    """One line saying what --space and --subnet cut the plan down to."""
+    bits = []
+    if args.space:
+        bits.append("IP space %s" % space_label)
+    if args.subnet:
+        bits.append("subnet " + ", ".join(args.subnet))
+    return "; ".join(bits)
+
+
+# ------------------------------------------------------------- fix-ranges
+
+def fix_ranges(old, key, args, sname, space_id=None):
+    """Give every range with no dhcp_host the one its parent subnet uses.
+
+    A separate run from a move, deliberately. A move rewrites a field that
+    already has a value and is undone by swapping two names, which we have run.
+    This fills a field that is empty, and its undo is to blank the field again,
+    which the API does accept. Mixed into one run, a half failure leaves you
+    guessing which half to reverse.
+
+    These ranges serve no leases at all, so this switches them on rather than
+    moving them. Nothing points them at the old target, which is why a move
+    cannot see them and only warns.
+    """
+    print("On   : %s  (%s, %s)" % (old.get("name"), old["kind"], old["id"]))
+    if space_id or args.subnet:
+        print("Only : %s" % _narrowing(args, sname(space_id)))
+    print("Mode : %s" % ("APPLY - changes will be written"
+                         if args.apply else "DRY RUN - no changes"))
+    print("")
+    print("Reading subnets and ranges ...")
+
+    subnets, _ = build_plan(old["id"], key, None, space_id, args.subnet)
+    print("  subnets found: %d" % len(subnets))
+    if not subnets:
+        print("")
+        print("Nothing points at that %s. No action." % old["kind"])
+        return 0
+
+    unassigned, checked = find_unassigned_ranges(subnets, key)
+    if not checked:
+        print("")
+        print("  NOTE: the lookup did not finish (too many subnets, or a call")
+        print("        failed). What is listed is real, but there may be more.")
+        print("        This run cannot finish the job. Its exit code says so.")
+    if not unassigned:
+        print("")
+        if not checked:
+            # An unfinished scan that found nothing is not the same answer as a
+            # finished scan that found nothing. Saying "no action" here would
+            # tell the operator the job is done when it was never looked at.
+            print("Found none, but the scan did not finish, so this is not a clean")
+            print("bill of health. Narrow it with --space or --subnet and run again.")
+            return 1
+        print("Every range inside those subnets already has a dhcp_host. No action.")
+        return 0
+
+    # One range is one object, and a range has nothing under it, so the cap is a
+    # plain count here. The move needs whole units; this does not.
+    total = len(unassigned)
+    if args.max is not None:
+        unassigned = unassigned[:args.max]
+
+    # Each range takes the value its own parent subnet uses.
+    by_id = dict((s["id"], s) for s in subnets)
+    rows = []
+    for r in unassigned:
+        parent = by_id.get(r.get("parent")) or {}
+        rows.append({
+            "object_type": "range",
+            "id": r["id"],
+            "parent_id": r.get("parent"),
+            "label": describe("range", r),
+            "name": r.get("name") or "",
+            "space": sname(r.get("space")),
+            "current_dhcp_host": "",
+            "new_dhcp_host": parent.get("dhcp_host") or "",
+            "action": "PATCH dhcp_host",
+            "result": "" if args.apply else "dry-run (not sent)",
+        })
+
+    print("")
+    print("  ranges with no dhcp_host: %d%s"
+          % (total, "" if args.max is None else " (%d selected by --max)" % len(rows)))
+    print("")
+    for row in rows[:40]:
+        print("  %-34s -> %s" % (row["label"], row["new_dhcp_host"] or "(parent has none)"))
+    if len(rows) > 40:
+        print("  ... and %d more (see the report)" % (len(rows) - 40))
+    print("")
+
+    if not args.apply:
+        write_report(args.report, rows)
+        print("DRY RUN complete. Nothing was changed.")
+        print("Full plan written to: %s" % os.path.abspath(args.report))
+        print("Re-run the same command with --apply to set these.")
+        return 0
+
+    ok = fail = skipped = 0
+    try:
+        for row in rows:
+            if not row["new_dhcp_host"]:
+                row["result"] = "SKIPPED: parent subnet has no dhcp_host either"
+                skipped += 1
+                print("  SKIPPED %s: parent has none" % row["label"])
+                continue
+            try:
+                # Someone may have set it since the plan was built. Only fill a
+                # range that is still empty; never overwrite a real value.
+                live = current_dhcp_host("ipam/range", row["id"], key)
+                if live:
+                    row["result"] = "SKIPPED: now set to %s" % live
+                    skipped += 1
+                    print("  SKIPPED %s: now %s" % (row["label"], live))
+                    continue
+                # And the value comes from the parent as it is now. Writing the
+                # snapshot's value would point the range at a host the subnet
+                # left, which is the exact breakage this mode exists to undo.
+                parent_now = current_dhcp_host("ipam/subnet", row["parent_id"], key)
+                if parent_now != row["new_dhcp_host"]:
+                    row["result"] = ("SKIPPED: parent subnet is now %s"
+                                     % (parent_now or "unset"))
+                    skipped += 1
+                    print("  SKIPPED %s: parent moved to %s"
+                          % (row["label"], parent_now or "unset"))
+                    continue
+                status = patch_dhcp_host("ipam/range", row["id"], row["new_dhcp_host"], key)
+                row["result"] = "HTTP %s" % status
+                ok += 1
+            except ApiError as e:
+                row["result"] = "FAILED: %s" % str(e).splitlines()[0]
+                fail += 1
+                print("  FAILED %s: %s" % (row["label"], row["result"]))
+            time.sleep(0.2)
+    finally:
+        write_report(args.report, rows)
+
+    print("")
+    print("Applied. set=%d failed=%d skipped=%d" % (ok, fail, skipped))
+    print("Report written to: %s" % os.path.abspath(args.report))
+
+    if args.verify:
+        print("")
+        print("Verifying ...")
+        left, rechecked = find_unassigned_ranges(subnets, key)
+        if not rechecked:
+            # The flag comes before the count. An unfinished re-scan cannot say
+            # "clean", and it cannot say a leftover is the only one either.
+            print("  The re-scan did not finish, so this is not proof. Run it again.")
+            return 1
+        if left:
+            print("  STILL with no dhcp_host: %d range(s)%s"
+                  % (len(left), "" if args.max is None else " (--max)"))
+            # Under --max leftovers are the point of the run. A failed write
+            # never is, so it still decides the exit code.
+            return 1 if (fail or args.max is None) else 0
+        print("  Clean: every range inside those subnets now has a dhcp_host.")
+
+    # A scan that never finished cannot report a finished job, however many
+    # ranges it did set.
+    return 1 if (fail or not checked) else 0
 
 
 # ---------------------------------------------------------------- main
@@ -358,12 +638,17 @@ def main():
     2 refused before writing anything.
     """
     p = argparse.ArgumentParser(
-        description="Move subnets and ranges between DHCP HA groups in Universal DDI.",
+        description="Move subnets and ranges between DHCP hosts and HA groups in Universal DDI.",
         epilog="Dry run by default. Nothing is written unless you pass --apply.")
-    p.add_argument("--old", help="Name of the HA group to move away from")
-    p.add_argument("--new", help="Name of the HA group to move to")
-    p.add_argument("--old-id", help="Resource id instead of --old, e.g. dhcp/ha_group/<uuid>")
+    p.add_argument("--old", help="Name of the HA group or DHCP host to move away from")
+    p.add_argument("--new", help="Name of the HA group or DHCP host to move to")
+    p.add_argument("--old-id", help="Resource id instead of --old, e.g. dhcp/ha_group/<uuid> or dhcp/host/<id>")
     p.add_argument("--new-id", help="Resource id instead of --new")
+    p.add_argument("--space", metavar="NAME",
+                   help="Only objects in this IP space, by name or resource id")
+    p.add_argument("--subnet", action="append", metavar="CIDR", default=None,
+                   help="Only this subnet and its ranges, e.g. 10.20.30.0/24. "
+                        "Repeat for more than one")
     p.add_argument("--max", type=int, metavar="N",
                    help="Pilot: about N objects, taken as whole subnet-plus-its-ranges "
                         "units, so a subnet with many ranges can exceed N rather than "
@@ -372,8 +657,13 @@ def main():
                    help="Actually write the changes. Without this it is a dry run.")
     p.add_argument("--verify", action="store_true",
                    help="After the run, re-query and confirm nothing is left on the old group")
-    p.add_argument("--report", default="ha-move-report.csv", help="CSV report path")
+    p.add_argument("--report", default=REPORT_DEFAULT, help="CSV report path")
     p.add_argument("--list-ha-groups", action="store_true", help="List HA groups and exit")
+    p.add_argument("--list-hosts", action="store_true",
+                   help="List DHCP hosts (one host running DHCP) and exit")
+    p.add_argument("--fix-ranges", action="store_true",
+                   help="Separate job: give every range with no dhcp_host the one "
+                        "its parent subnet uses. Takes --old, never --new")
     p.epilog = ((p.epilog or "") +
                 "\n\nNot an Infoblox product: unsupported, unaffiliated, "
                 "no warranty. Use at your own risk.")
@@ -387,6 +677,28 @@ def main():
         return 2
 
     try:
+        # Listing is its own run. Silently ignoring the rest of a command line
+        # would let someone believe a move had been considered.
+        if args.list_ha_groups and args.list_hosts:
+            p.error("--list-ha-groups and --list-hosts list different things; "
+                    "run one at a time")
+        if args.list_ha_groups or args.list_hosts:
+            # "is not None" rather than truthiness: --max 0 is still an
+            # argument someone typed, and ignoring it hides their mistake.
+            busy = [n for n, v in (("--old", args.old), ("--old-id", args.old_id),
+                                   ("--new", args.new), ("--new-id", args.new_id),
+                                   ("--space", args.space), ("--subnet", args.subnet),
+                                   ("--apply", args.apply), ("--verify", args.verify),
+                                   ("--fix-ranges", args.fix_ranges))
+                    if v is not None and v is not False]
+            if args.max is not None:
+                busy.append("--max")
+            if args.report != REPORT_DEFAULT:
+                busy.append("--report")
+            if busy:
+                p.error("a list flag only lists. Drop %s, or drop the list flag"
+                        % ", ".join(busy))
+
         if args.list_ha_groups:
             names = space_names(key)
             for g in list_ha_groups(key):
@@ -395,45 +707,84 @@ def main():
                     names.get(g.get("ip_space"), g.get("ip_space") or "-"), g.get("id")))
             return 0
 
-        if not (args.old or args.old_id) or not (args.new or args.new_id):
+        if args.list_hosts:
+            names = space_names(key)
+            for h in list_hosts(key):
+                print("%-45s %-13s %-28s %s" % (
+                    h.get("name"), h.get("type") or "-",
+                    names.get(h.get("ip_space"), h.get("ip_space") or "-"), h.get("id")))
+            return 0
+
+        if args.fix_ranges:
+            if args.new or args.new_id:
+                p.error("--fix-ranges takes --old only; it sets ranges to match "
+                        "their own subnet, so there is nothing to give as --new")
+        elif not (args.old or args.old_id) or not (args.new or args.new_id):
             p.error("need --old/--new (or --old-id/--new-id)")
+        if not (args.old or args.old_id):
+            p.error("need --old (or --old-id)")
         if args.old and args.old_id:
             p.error("give --old or --old-id, not both")
         if args.new and args.new_id:
             p.error("give --new or --new-id, not both")
+        for c in args.subnet or []:
+            if not _looks_like_cidr(c):
+                p.error('--subnet takes an IPv4 address and a prefix, e.g. '
+                        '10.20.30.0/24, not "%s"' % c)
         if args.max is not None and args.max < 1:
             p.error("--max must be 1 or more")
         if args.verify and not args.apply:
             p.error("--verify only means something with --apply; a dry run already "
-                    "shows what is still on the old group")
+                    "shows what is still outstanding")
 
-        old = resolve_group(args.old, args.old_id, key)
-        new = resolve_group(args.new, args.new_id, key)
-
-        if old["id"] == new["id"]:
-            print("ERROR: source and target HA group are the same.", file=sys.stderr)
-            return 2
+        old = resolve_target(args.old, args.old_id, key)
+        space_id = find_space(args.space, key) if args.space else None
 
         names = space_names(key)
-        target_space = new.get("ip_space")
 
         def sname(s):
             return names.get(s, s or "-")
 
-        print("From : %s  (%s)" % (old.get("name"), old["id"]))
-        print("To   : %s  (%s)" % (new.get("name"), new["id"]))
-        print("       target HA group IP space: %s" % sname(target_space))
+        if args.fix_ranges:
+            return fix_ranges(old, key, args, sname, space_id)
+
+        new = resolve_target(args.new, args.new_id, key)
+
+        if old["id"] == new["id"]:
+            print("ERROR: source and target are the same.", file=sys.stderr)
+            return 2
+
+        # A dhcp/host row is not always something a subnet can point at. A host
+        # of type nios_ddi is a NIOS appliance seen through this API, and the
+        # server answers "Cannot assign host of type: NIOS DDI to Subnet object"
+        # on every write. Refuse once here rather than once per object.
+        if new.get("type") == "nios_ddi":
+            print("ERROR: %s is a NIOS DDI host. A subnet or range cannot point at"
+                  % new.get("name"), file=sys.stderr)
+            print("       one; the server refuses every write. Pick a uddi "
+                  "host or an", file=sys.stderr)
+            print("       HA group. --list-hosts shows the type.", file=sys.stderr)
+            return 2
+
+        target_space = new.get("ip_space")
+
+        print("From : %s  (%s, %s)" % (old.get("name"), old["kind"], old["id"]))
+        print("To   : %s  (%s, %s)" % (new.get("name"), new["kind"], new["id"]))
+        print("       target IP space: %s" % sname(target_space))
         print("Mode : %s" % ("APPLY - changes will be written" if args.apply else "DRY RUN - no changes"))
+        if space_id or args.subnet:
+            print("Only : %s" % _narrowing(args, sname(space_id)))
         print("")
         print("Reading subnets and ranges ...")
 
-        subnets, ranges = build_plan(old["id"], key, args.max)
+        subnets, ranges = build_plan(old["id"], key, args.max,
+                                     space_id, args.subnet)
         print("  subnets found: %d" % len(subnets))
         print("  ranges  found: %d" % len(ranges))
 
         if not subnets and not ranges:
             print("")
-            print("Nothing points at that HA group. No action.")
+            print("Nothing points at that %s. No action." % old["kind"])
             return 0
 
         # --- unassigned ranges --------------------------------------------------
@@ -442,12 +793,12 @@ def main():
         unassigned, checked = find_unassigned_ranges(subnets, key)
         if not checked:
             print("")
-            print("  NOTE: the check for ranges with no HA group of their own did not")
+            print("  NOTE: the check for ranges with no dhcp_host of their own did not")
             print("        finish (too many subnets, or a lookup failed). Any listed")
             print("        below are real, but there may be more.")
         if unassigned:
             print("")
-            print("  WARNING: %d range(s) inside these subnets have no HA group of their own."
+            print("  WARNING: %d range(s) inside these subnets have no dhcp_host of their own."
                   % len(unassigned))
             print("           A range serves leases only when its own dhcp_host is set, so")
             print("           these are not serving now and this tool does not change them.")
@@ -455,8 +806,8 @@ def main():
                 print("             %s" % describe("range", o))
             if len(unassigned) > 10:
                 print("             ... and %d more" % (len(unassigned) - 10))
-            print("           Set an HA group on each one - normally the same group as the")
-            print("           subnet it sits in.")
+            print("           Set a dhcp_host on each one - normally the same group or")
+            print("           host as the subnet it sits in.")
 
 
         # --- IP-space precheck -------------------------------------------------
@@ -468,11 +819,12 @@ def main():
 
         print("")
         if not target_space:
-            print("PRECHECK: target HA group reports no IP space - skipping the check.")
+            print("PRECHECK: target %s reports no IP space - skipping the check."
+                  % new["kind"])
             print("          The server is still the authority; failures will be per object.")
         elif bad:
             print("PRECHECK FAILED: %d object(s) are in a different IP space than the" % len(bad))
-            print("                 target HA group (%s)." % sname(target_space))
+            print("                 target %s (%s)." % (new["kind"], sname(target_space)))
             print("                 The server will reject these.")
             for o in bad[:10]:
                 kind = "subnet" if o in s_bad else "range"
@@ -480,11 +832,11 @@ def main():
             if len(bad) > 10:
                 print("    ... and %d more" % (len(bad) - 10))
             print("")
-            print("Refusing to start. Pick an HA group whose hosts are in the same")
-            print("IP space as the objects you are moving.")
+            print("Refusing to start. Pick a target in the same IP space as the")
+            print("objects you are moving.")
             return 2
         else:
-            print("PRECHECK OK: all objects are in the target HA group's IP space (%s)."
+            print("PRECHECK OK: all objects are in the target's IP space (%s)."
                   % sname(target_space))
 
         subnets, ranges = s_ok, r_ok
@@ -507,6 +859,7 @@ def main():
                     "label": describe(kind, o),
                     "name": o.get("name") or "",
                     "space": sname(o.get("space")),
+                    "parent_id": o.get("parent") or "",
                     "current_dhcp_host": o.get("dhcp_host") or "",
                     "new_dhcp_host": new["id"],
                     "action": "PATCH dhcp_host",
@@ -530,17 +883,34 @@ def main():
         # Subnets before ranges: a range whose host no longer serves the parent
         # subnet stops issuing leases, so close that window from the top down.
         ok = fail = skipped = 0
+        stranded, astray = set(), set()
         try:
             for row in rows:
                 coll = "ipam/subnet" if row["object_type"] == "subnet" else "ipam/range"
+                # Subnets are written first. If one of them failed, its ranges
+                # must stay with it: a range on the new target under a subnet
+                # still on the old one is the split this tool exists to prevent.
+                if row["object_type"] == "range" and row.get("parent_id") in stranded:
+                    row["result"] = "SKIPPED: its subnet failed to move"
+                    skipped += 1
+                    print("  SKIPPED range %s: its subnet failed" % row["label"])
+                    continue
                 try:
                     # The plan was built moments ago, but someone else may have
                     # touched this object since. Only move what still points at
                     # the group we were asked to move away from.
                     live = current_dhcp_host(coll, row["id"], key)
                     if live != old["id"]:
-                        row["result"] = "SKIPPED: no longer on the old group"
+                        # Already on the target is a job someone else finished.
+                        # Anywhere else is a third party moving it mid-run, and
+                        # the run must not report that as done.
+                        elsewhere = live != new["id"]
+                        row["result"] = ("SKIPPED: now on %s" % (live or "nothing")
+                                         if elsewhere
+                                         else "SKIPPED: already on the target")
                         skipped += 1
+                        if elsewhere:
+                            astray.add(row["id"])
                         print("  SKIPPED %s %s: now %s" % (
                             row["object_type"], row["label"], live or "unset"))
                         continue
@@ -550,6 +920,8 @@ def main():
                 except ApiError as e:
                     row["result"] = "FAILED: %s" % str(e).splitlines()[0]
                     fail += 1
+                    if row["object_type"] == "subnet":
+                        stranded.add(row["id"])
                     print("  FAILED %s %s: %s" % (row["object_type"], row["label"], row["result"]))
                 # Deliberate throttle: roughly five writes a second, to stay well
                 # clear of any API rate limit on a large run.
@@ -572,29 +944,49 @@ def main():
             print("")
             print("Verifying ...")
             ls, lr = build_plan(old["id"], key)
-            planned = set(row["id"] for row in rows)
-            still = [o for o in ls + lr if o.get("id") in planned]
+            # Only objects the server accepted. One that failed is already
+            # counted and printed as a failure; calling it "did not persist"
+            # sends the reader looking for a second, different problem.
+            written = set(row["id"] for row in rows
+                          if str(row["result"]).startswith("HTTP"))
+            still = [o for o in ls + lr if o.get("id") in written]
             unwritten = len(still)
             if unwritten:
-                print("  FAILED TO PERSIST: %d object(s) this run wrote are still on"
+                print("  FAILED TO PERSIST: %d object(s) the server accepted are still"
                       % unwritten)
-                print("                     the old group. Re-run the dry run.")
+                print("                     on the old group. Re-run the dry run.")
                 for o in still[:10]:
                     print("    %s" % (o.get("address") or o.get("start") or o.get("id")))
             elif ls or lr:
-                print("  Everything this run selected has moved. %d subnets and %d "
-                      "ranges are still on the old group and were not selected%s."
-                      % (len(ls), len(lr), " (--max)" if args.max else ""))
+                # Leftovers are expected only when the run was narrowed. On a run
+                # that asked for everything they are a surprise, and calling them
+                # "not selected" would hide it behind an exit code of 0.
+                narrowed = args.max is not None or args.space or args.subnet
+                if narrowed:
+                    print("  Everything this run selected has moved. %d subnets and %d "
+                          "ranges are still on the old group and were not selected "
+                          "(%s)." % (len(ls), len(lr), _why_narrowed(args)))
+                else:
+                    print("  UNEXPECTED: nothing narrowed this run, yet %d subnets and"
+                          % len(ls))
+                    print("              %d ranges still point at the old %s. They"
+                          % (len(lr), old["kind"]))
+                    print("              appeared after the plan was built. Re-run "
+                          "the dry run.")
+                    unwritten = len(ls) + len(lr)
             else:
-                print("  Clean: nothing still points at the old HA group.")
+                print("  Clean: nothing still points at the old %s." % old["kind"])
 
         # Non-zero if a write failed, or if something we wrote did not stick.
         # A caller scripting this needs a failed move to look like a failure.
-        if fail or unwritten:
+        if fail or unwritten or astray:
             return 1
         return 0
 
     except ApiError as e:
+        # Piped output buffers stdout but not stderr, so an unflushed plan would
+        # print after the error that stopped it.
+        sys.stdout.flush()
         print("ERROR: %s" % e, file=sys.stderr)
         return 2
     except KeyboardInterrupt:
