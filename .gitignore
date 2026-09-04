@@ -4,7 +4,9 @@
 *.pem
 .env
 
-# script run output — contains tenant object ids
+# script run output and portal exports — contain tenant object ids
+# no CSV in this repo is meant to be committed
+*.csv
 ha-move-report.csv
 *-report.csv
 
@@ -14,3 +16,6 @@ __pycache__/
 
 # local test data — tenant-specific, not for the repo
 test/
+
+# agent worktree scratch
+.orca/

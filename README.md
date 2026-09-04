@@ -20,8 +20,8 @@ group to another, with a script or through the portal's CSV import.
 > unofficial part.
 
 [Read first](#read-first) · [Run the script](#run-the-script) ·
-[What we found](#what-we-found) · [CSV fallback](#csv-fallback) ·
-[Not tested](#not-tested)
+[A worked example](#a-worked-example) · [What we found](#what-we-found) ·
+[CSV fallback](#csv-fallback) · [Not tested](#not-tested)
 
 ## Read first
 
@@ -57,6 +57,29 @@ the CSV column takes the name.
 - An API key with write access: Portal > your name > User Profile > API Keys.
   Expired keys fail with `401`; make a new one rather than re-pasting.
 
+The export lives only in the shell that ran it. In a terminal window you export
+once, then run the script in that same window. Inside an agent or a CI step each
+line often gets a fresh shell, so put both on one line:
+
+```
+export INFOBLOX_API_KEY='<your-key>' && python3 move_ha_group.py --list-ha-groups
+```
+
+### Is the key set?
+
+Ask the shell you are about to run in. This prints the length, never the key:
+
+```
+[ -n "$INFOBLOX_API_KEY" ] && echo "set, ${#INFOBLOX_API_KEY} characters" \
+  || echo "not set in this shell"
+```
+
+`not set` means the export did not reach this shell. Export it again here.
+
+A set variable is not a working key. `--list-ha-groups` is the real test: it
+either lists your groups or fails with `401`. A `401` means the key is wrong or
+expired, so make a new one rather than re-pasting.
+
 ```
 export INFOBLOX_API_KEY=<your-key>
 
@@ -78,21 +101,145 @@ python3 move_ha_group.py --old "<new>" --new "<old>" --apply --verify
 
 ### Options
 
-| Flag | What it does |
-|---|---|
-| `--apply` | Writes. Without it, every run is a dry run |
-| `--max N` | Pilot: about N objects. Takes whole units — a subnet with all of its ranges — so a subnet with many ranges can exceed N rather than be split from them. You do not choose which |
-| `--verify` | Re-query afterwards; reports anything left on the old group |
-| `--list-ha-groups` | Every HA group with its id, then exit |
-| `--report` | Per-object CSV: one row each, with its result |
-| `--old-id`, `--new-id` | Give a resource id instead of a name |
+| Flag | What it does | Example |
+|---|---|---|
+| `--apply` | Writes. Without it, every run is a dry run | `--apply` |
+| `--max N` | Cap the run at about N objects | `--max 5` |
+| `--verify` | Re-read afterwards; report anything left on the old group | `--verify` |
+| `--list-ha-groups` | Print every HA group with its id, then exit | `--list-ha-groups` |
+| `--report` | Where to write the per-object CSV | `--report pilot.csv` |
+| `--old-id`, `--new-id` | A resource id instead of a name | `--old-id dhcp/ha_group/1a2b...` |
 
-**`--max` is the blast-radius control.** It is the one to reach for on a first
-run: move five, check them, then run again without it.
+### How `--max` counts
 
-A capped run takes whole units: a subnet together with every range inside it, or
-a lone range whose parent subnet is not moving. It never splits a subnet from its
-ranges, which is why it can go slightly over the number you asked for.
+`--max` is the blast-radius control. Reach for it on the first run: move five,
+check them in the portal, then run again without it.
+
+It counts objects, not subnets. A subnet is one object and each range is another.
+
+It takes whole units. A unit is a subnet with every range inside it, or a lone
+range whose parent subnet is not moving. It never splits a subnet from its
+ranges, so the count is approximate.
+
+Say the old group holds this, and you pass `--max 5`:
+
+| Unit | Objects | `--max 5` |
+|---|---|---|
+| Subnet A + 2 ranges | 3 | moves — 3 used |
+| Subnet B + 4 ranges | 5 | skipped — 3 + 5 is over 5 |
+| Subnet C, no ranges | 1 | moves — 4 used |
+| Lone range in a subnet staying put | 1 | moves — 5 used |
+
+Five objects moved, out of ten. A skipped unit does not stop the run: the script
+keeps going and takes later units that still fit.
+
+The first unit is the exception. It is always taken, even when it is bigger than
+N on its own. `--max 2` against a subnet with six ranges moves all seven objects.
+
+You do not choose which units. Run the dry run first and read the report to see
+what the next run would take.
+
+## A worked example
+
+One site, two groups. Everything on `DC2-DHCP-HA-OLD` moves to `DC2-DHCP-HA-NEW`.
+
+**`--old` and `--new` take an HA group name.** Not a subnet, not a subnet id.
+Spell the name as the portal spells it. Use `--old-id` and `--new-id` if you
+prefer the resource id `dhcp/ha_group/<uuid>`.
+
+**You do not name the subnets.** The script moves every subnet and every range
+whose `dhcp_host` is the old group. There is no subnet filter. You pick the pair
+of groups, and `--max` caps how many objects a run touches.
+
+### 1. Get the exact names
+
+```
+export INFOBLOX_API_KEY='<your-key>'
+python3 move_ha_group.py --list-ha-groups
+```
+
+One line per group: name, mode, IP space, id.
+
+```
+DC2-DHCP-HA-OLD    active-passive   Corporate   dhcp/ha_group/1a2b...
+DC2-DHCP-HA-NEW    active-passive   Corporate   dhcp/ha_group/9f8e...
+```
+
+Copy the names from that output. The portal lists the same groups under
+Network > DHCP > HA Groups. Both groups must sit in one IP space. The script
+checks that before it writes, and the server refuses a mismatch anyway.
+
+### 2. Dry run
+
+```
+python3 move_ha_group.py --old "DC2-DHCP-HA-OLD" --new "DC2-DHCP-HA-NEW"
+```
+
+It reads the tenant and prints the plan:
+
+```
+From : DC2-DHCP-HA-OLD  (dhcp/ha_group/1a2b...)
+To   : DC2-DHCP-HA-NEW  (dhcp/ha_group/9f8e...)
+Mode : DRY RUN - no changes
+
+  subnets to move: 4
+  ranges  to move: 6
+
+  subnet  10.20.30.0/24                        Floor 2 data
+  range   10.20.30.50-10.20.30.200             Floor 2 pool
+
+DRY RUN complete. Nothing was changed.
+Full plan written to: /path/ha-move-report.csv
+```
+
+A dry run sends no writes. It writes one local file, `ha-move-report.csv`, with
+a row per object. Read that file before step 3.
+
+### 3. Pilot five, then check
+
+```
+python3 move_ha_group.py --old "DC2-DHCP-HA-OLD" --new "DC2-DHCP-HA-NEW" \
+  --max 5 --apply --verify
+```
+
+Open those five in the portal. The **Edit** dialog shows the HA group; the side
+panel does not.
+
+### 4. The rest, then confirm
+
+```
+python3 move_ha_group.py --old "DC2-DHCP-HA-OLD" --new "DC2-DHCP-HA-NEW" \
+  --apply --verify
+```
+
+`--verify` re-reads afterwards and prints what is still on the old group.
+
+### 5. Undo, if you need it
+
+```
+python3 move_ha_group.py --old "DC2-DHCP-HA-NEW" --new "DC2-DHCP-HA-OLD" \
+  --apply --verify
+```
+
+Names swapped. Each run builds its plan from the current state, so this finds
+exactly what the last run moved.
+
+### Different subnets to different groups
+
+The script does one pair of groups per run. For two target groups, run it twice,
+once per pair, after the objects are split across two source groups. It cannot
+send some subnets on the same source group one way and the rest another way.
+
+The CSV method can: `dhcp_host` is a per-row value, so one file can send row A
+to one group and row B to another. We have not tested a mixed file.
+
+### The two CSV files
+
+`move.csv` and `rollback.csv` are the same rows, twice. `rollback.csv` is the
+untouched copy, straight from the export. `move.csv` is the copy where you set
+`dhcp_host` to the new group. One is the change, the other is the way back.
+
+They are not one file per subnet group.
 
 ## What we found
 
