@@ -761,8 +761,8 @@ def main():
         if new.get("type") == "nios_ddi":
             print("ERROR: %s is a NIOS DDI host. A subnet or range cannot point at"
                   % new.get("name"), file=sys.stderr)
-            print("       one; the server refuses every write. Pick a uddi "
-                  "host or an", file=sys.stderr)
+            print("       one; the server refuses every write. Pick a host of "
+                  "another type or an", file=sys.stderr)
             print("       HA group. --list-hosts shows the type.", file=sys.stderr)
             return 2
 

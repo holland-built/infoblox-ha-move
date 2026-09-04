@@ -19,13 +19,14 @@ host or HA group to another, with a script or through the portal's CSV import.
 > The CSV method below uses supported Infoblox portal features. The script is the
 > unofficial part.
 
-[Read first](#read-first) · [Run the script](#run-the-script) ·
+[Read first](#read-first) · [The whole job](#the-whole-job) ·
+[Run the script](#run-the-script) ·
 [A worked example](#a-worked-example) ·
 [Fix ranges](#fix-ranges-that-serve-nothing) ·
 [What we found](#what-we-found) · [CSV fallback](#csv-fallback) ·
 [Not tested](#not-tested)
 
-Most sections below fold. Read first is always open.
+Most sections below fold. Read first and The whole job stay open.
 
 Links between sections do not open a closed fold, so open the one you are sent
 to.
@@ -49,6 +50,10 @@ method — same job, more steps, and one option that can delete a lot of a tenan
 
 ### What goes in `dhcp_host`
 
+**The portal calls this field Service Instance.** The API field and the CSV
+column are both named `dhcp_host`. Same field, two names. It is the only field
+either method changes.
+
 | Value | Means |
 |---|---|
 | `DC2-DHCP-HA` | An HA group, by name, exactly as the portal spells it, spaces included |
@@ -65,10 +70,63 @@ hosts `dhcp/host/<number>`, but the CSV column takes the name.
 tenant it held 167 rows against 101 there. Read the DHCP list, not the appliance
 list.
 
+## The whole job
+
+One site runs a lone DHCP host. Another sits in an old pair whose partner is
+gone. A new pair is built for both, and everything on the two old sources moves
+onto it. Names used here:
+
+| Name | What it is |
+|---|---|
+| `site-a-dhcp01` | the lone DHCP host |
+| `SITE-B-HA-OLD` | the old pair, half of it dead |
+| `SITE-AB-HA` | the new pair, already built |
+
+**`--old` and `--new` name a source and a target.** Each one is an HA group or a
+DHCP host, by name. Not a subnet, and not an id — `--old-id` and `--new-id` take
+those. You never list the subnets: the script finds every subnet and range
+whose `dhcp_host` is `--old`, and points it at `--new`.
+
+Two sources, so two runs. Same target both times.
+
+```
+export INFOBLOX_API_KEY='<your-key>'
+
+# 1. exact names. Groups and hosts are two lists
+python3 move_ha_group.py --list-hosts
+python3 move_ha_group.py --list-ha-groups
+
+# 2. dry run each source: prints the plan, writes a report, changes nothing
+python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA"
+python3 move_ha_group.py --old "SITE-B-HA-OLD" --new "SITE-AB-HA"
+
+# 3. pilot: cap one source at five objects, then check those five in the portal
+python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA" --max 5 --apply --verify
+
+# 4. the rest
+python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA" --apply --verify
+python3 move_ha_group.py --old "SITE-B-HA-OLD" --new "SITE-AB-HA" --apply --verify
+
+# undo: the same command with the names swapped
+python3 move_ha_group.py --old "SITE-AB-HA" --new "site-a-dhcp01" --apply --verify
+```
+
+To take part of a site rather than all of it, add `--subnet 10.20.30.0/24`,
+repeated per subnet, or `--space Corporate`. See
+[Choosing which subnets move](#choosing-which-subnets-move).
+
+**Consider not moving the old pair at all.** Edit `SITE-B-HA-OLD` in the portal,
+swap the dead host for the new one, rename it. Every subnet on it follows with no
+subnet edits. Then only the lone host needs a run. Which is less work depends on
+the counts, so read both dry runs first.
+
+No Python, or no API key? [CSV fallback](#csv-fallback) does the same job in the
+portal, on the same field.
+
 ## Run the script
 
 <details>
-<summary>What you need, the key check, and the four runs</summary>
+<summary>What you need, the key check, and the options</summary>
 
 - Python 3.7+, standard library only. Installing Python is out of scope; if you
   cannot, use the CSV method.
@@ -99,24 +157,8 @@ A set variable is not a working key. `--list-ha-groups` is the real test: it
 either lists your groups or fails with `401`. A `401` means the key is wrong or
 expired, so make a new one rather than re-pasting.
 
-```
-export INFOBLOX_API_KEY=<your-key>
-
-# 1. exact group names
-python3 move_ha_group.py --list-ha-groups
-
-# 2. dry run: prints the plan, writes a report, changes nothing
-python3 move_ha_group.py --old "<old>" --new "<new>"
-
-# 3. pilot: cap it, then check
-python3 move_ha_group.py --old "<old>" --new "<new>" --max 5 --apply --verify
-
-# 4. the rest
-python3 move_ha_group.py --old "<old>" --new "<new>" --apply --verify
-
-# rollback: same command, names swapped
-python3 move_ha_group.py --old "<new>" --new "<old>" --apply --verify
-```
+The four runs, with real names on them, are in
+[The whole job](#the-whole-job).
 
 ### Options
 
@@ -223,9 +265,9 @@ Name, type, IP space, id. A `nios_ddi` host cannot serve a subnet, and is
 refused before any write:
 
 ```
-site-a-dhcp01                uddi   Corporate   dhcp/host/10001
-site-b-dhcp01                uddi   Corporate   dhcp/host/10002
-old-grid-member              nios_ddi      -           dhcp/host/10003
+site-a-dhcp01                uddi       Corporate   dhcp/host/10001
+site-b-dhcp01                uddi       Corporate   dhcp/host/10002
+site-c-dhcp01                nios_ddi   -           dhcp/host/10003
 ```
 
 ```
@@ -319,28 +361,8 @@ swapped command to undo it.
 
 ### Two sites at once
 
-One new pair, two sources. Site A runs a lone host. Site B sits in an old pair
-whose partner is gone.
-
-```
-site-a-dhcp01   one DHCP host           subnets carry dhcp_host = site-a-dhcp01
-SITE-B-HA-OLD   a degraded HA group     subnets carry dhcp_host = SITE-B-HA-OLD
-```
-
-Two sources, so two runs. Same target both times:
-
-```
-python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA" --apply --verify
-python3 move_ha_group.py --old "SITE-B-HA-OLD" --new "SITE-AB-HA" --apply --verify
-```
-
-Dry run each one first, as above.
-
-**Consider not moving the second set at all.** Edit the degraded group in the
-portal, swap the dead host for the new one, rename it. Every subnet on it follows
-with no subnet edits. Then only the single-host site needs a run.
-
-Which is less work depends on the counts. Read both dry runs before choosing.
+One new pair, two sources: one run per source, the same target both times.
+Worked through at the top, in [The whole job](#the-whole-job).
 
 ### Different subnets to different groups
 
@@ -350,14 +372,6 @@ way.
 
 The CSV method can: `dhcp_host` is a per-row value, so one file can send row A
 to one group and row B to another. We have not tested a mixed file.
-
-### The two CSV files
-
-`move.csv` and `rollback.csv` are the same rows, twice. `rollback.csv` is the
-untouched copy, straight from the export. `move.csv` is the copy where you set
-`dhcp_host` to the new group. One is the change, the other is the way back.
-
-They are not one file per subnet group.
 
 </details>
 
@@ -476,10 +490,10 @@ value. This fills a field that is empty. One run, one kind of undo.
   script says it is skipping its precheck and lets the writes go. One such group
   took them. A newly built group in an earlier round refused them. So the skip
   buys you the server's answer, per object, and nothing more.
-- **Not every DHCP host can serve a subnet.** A host has a `type`. A
-  `uddi` host works. A `nios_ddi` host is refused on every write with
-  `Cannot assign host of type: NIOS DDI to Subnet object`. That tenant held 119
-  of the first and 48 of the second, which is also why `dhcp/host` outnumbers
+- **Not every DHCP host can serve a subnet.** A host has a `type`. Any type but
+  `nios_ddi` works. A `nios_ddi` host is refused on every write with
+  `Cannot assign host of type: NIOS DDI to Subnet object`. That tenant held 48
+  of those against 119 that work, which is also why `dhcp/host` outnumbers
   `infra/host`. `--list-hosts` prints the type, and a `nios_ddi` target is now
   refused before anything is written.
 - **A host already in an HA group cannot be a subnet's `dhcp_host`.** Refused on
@@ -526,9 +540,33 @@ value. This fills a field that is empty. One run, one kind of undo.
 <summary>The portal route: export, edit one column, import</summary>
 
 
-The `dhcp_host` column takes a DHCP host name exactly as it takes an HA group
-name. A site on one host and a site on a pair are the same edit, in the same
-column. A `nios_ddi` host is refused here too, by the same server rule.
+### The column
+
+**Service Instance in the portal is `dhcp_host` in the CSV.** That one column
+carries the assignment, and it is the only column to touch. It sits on two
+header rows, and you edit it on both:
+
+```
+HEADER-ipamdhcp-v3-subnet,key,name,comment,space,...,dhcp_host,...
+HEADER-ipamdhcp-v3-range,key,space,start,end,...,dhcp_host,...
+```
+
+The value is a name, spelled as the portal spells it: `SITE-AB-HA` for a pair,
+`site-a-dhcp01` for a lone host. Both kinds go in that same column, so a site on one
+host and a site on a pair are the same edit. A `nios_ddi` host is refused here
+too, by the same server rule.
+
+### The two files
+
+`move.csv` and `rollback.csv` are the same rows, twice. `rollback.csv` is the
+untouched copy, straight from the export. `move.csv` is the copy where you set
+`dhcp_host` to the new pair. One is the change, the other is the way back.
+
+**Not one file per source.** `dhcp_host` is a per-row value, so rows off a lone
+host and rows off an old pair go in the same `move.csv` and take the same new
+value. Rows could equally carry different values and send different subnets to
+different pairs, which is the one thing the script cannot do. We have not tested
+a mixed file.
 
 > **Import type must be "Add new records and update existing records."** Never one
 > with **"delete"** in the label: by their own wording those remove every object
