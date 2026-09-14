@@ -19,41 +19,34 @@ host or HA group to another, with a script or through the portal's CSV import.
 > The CSV method below uses supported Infoblox portal features. The script is the
 > unofficial part.
 
-[Read first](#read-first) · [The whole job](#the-whole-job) ·
-[Run the script](#run-the-script) ·
-[A worked example](#a-worked-example) ·
-[Pair to one of its own hosts](#pair-to-one-of-its-own-hosts) ·
-[Fix ranges](#fix-ranges-that-serve-nothing) ·
-[What we found](#what-we-found) · [CSV fallback](#csv-fallback) ·
+[Read first](#read-first) · [Pick a method](#pick-a-method) ·
+[Run the script](#run-the-script) · [Worked examples](#worked-examples) ·
+[CSV fallback](#csv-fallback) · [What we found](#what-we-found) ·
 [Not tested](#not-tested)
 
-Most sections below fold. Read first and The whole job stay open.
-
-Links between sections do not open a closed fold, so open the one you are sent
-to.
+Read first and Pick a method stay open. The rest fold. A link into a closed
+fold does not open it, so open the one you are sent to.
 
 ## Read first
 
-- **Ranges do not move with their subnet.** The range is what hands out leases.
-  Move both.
-- **A range with no `dhcp_host` of its own serves nothing.** It does not inherit
-  one from its subnet — that is Infoblox's answer, not something we watched. What
-  we did see is that such a range is invisible to any search for "things on the
-  old group", so neither method finds it. The script lists these separately, and
-  `--fix-ranges` sets them.
-- **Leases do not move either.** Clients keep their address until renewal, and at
-  renewal may keep it, get another, or get none. Assign ranges before leases start
-  expiring. This is Infoblox guidance, not something tested here.
+**Ranges do not move with their subnet.** The range is what hands out leases.
+Move both.
 
-Use the script if you can run Python and get an API key: it shows you the plan
-before it writes, and can be capped to a few objects. Otherwise use the CSV
-method — same job, more steps, and one option that can delete a lot of a tenant.
+A range with no `dhcp_host` of its own serves nothing. It does not inherit one
+from its subnet. That is Infoblox's answer; we did not watch it happen. What we
+did see is that such a range is invisible to any search for "things on the old
+group", so neither method finds it. The script lists these separately, and
+`--fix-ranges` sets them.
+
+Leases do not move either. Clients keep their address until renewal, and at
+renewal may keep it, get another, or get none. Assign ranges before leases start
+expiring. This is Infoblox guidance and was not tested here.
 
 ### What goes in `dhcp_host`
 
-**The portal calls this field Service Instance.** The API field and the CSV
-column are both named `dhcp_host`. Same field, two names. It is the only field
-either method changes.
+The portal calls this field Service Instance. The API field and the CSV column
+are both named `dhcp_host`. Same field, two names. It is the only field either
+method changes.
 
 | Value | Means |
 |---|---|
@@ -61,21 +54,52 @@ either method changes.
 | `site-a-dhcp01` | A DHCP host, by name. One host running DHCP, which is what a site has before anyone builds a pair for it |
 | *(empty)* | Nothing serves this object. On a range, that means no leases |
 
-One field, two kinds of value. That is why a site on one host and a site on an
-HA group are the same job, not two.
+One field, two kinds of value. A site on one host and a site on an HA group are
+therefore the same job.
 
-Use the name, not a resource id. The API calls groups `dhcp/ha_group/<uuid>` and
-hosts `dhcp/host/<number>`, but the CSV column takes the name.
+Use the name. The API calls groups `dhcp/ha_group/<uuid>` and hosts
+`dhcp/host/<number>`, and the script takes those through `--old-id` and
+`--new-id`, but the CSV column takes the name.
 
-`dhcp/host` is not the same list as the appliances under `infra/host`. In one lab
-tenant it held 167 rows against 101 there. Read the DHCP list, not the appliance
-list.
+`dhcp/host` is a different list from the appliances under `infra/host`. In one
+lab tenant it held 167 rows against 101 there. Read the DHCP list.
 
-## The whole job
+## Pick a method
+
+```mermaid
+flowchart TD
+    Q["Can you run Python and get an API key?"]
+    Q -->|yes| S["Script: dry run, then --max, then --apply"]
+    Q -->|no| C["CSV: export, edit dhcp_host, import"]
+```
+
+| | Script | CSV import |
+|---|---|---|
+| Needs | Python 3.7+, an API key, HTTPS to `csp.infoblox.com` | Portal access |
+| Shows the plan before writing | Yes, every run is a dry run until `--apply` | No. You diff the two files yourself |
+| Limit the blast radius | `--max`, `--subnet`, `--space` | Trim the file by hand |
+| Different subnets to different targets in one run | No. One source and one target per run | Yes, `dhcp_host` is a per-row value. Untested |
+| Time | Seconds; the plan is a filtered query | About 15 minutes per import. An export took about 16 minutes |
+| Can delete things | No. It only changes `dhcp_host` | One import type removes every object missing from your file. Never pick it |
+
+Both methods edit the same field. If you cannot install Python, use the CSV
+method; installing Python is out of scope here.
+
+Before moving an old pair, consider editing it instead. If a pair has lost a
+host, open it in the portal, swap the dead host for the new one, and rename it.
+Every subnet on it follows with no subnet edits. Which is less work depends on
+the counts, so read both dry runs first.
+
+## Run the script
+
+<details>
+<summary>Quick start, the key check, options, choosing subnets, and the cap</summary>
+
+### Quick start
 
 One site runs a lone DHCP host. Another sits in an old pair whose partner is
 gone. A new pair is built for both, and everything on the two old sources moves
-onto it. Names used here:
+onto it.
 
 | Name | What it is |
 |---|---|
@@ -83,12 +107,11 @@ onto it. Names used here:
 | `SITE-B-HA-OLD` | the old pair, half of it dead |
 | `SITE-AB-HA` | the new pair, already built |
 
-**`--old` and `--new` name a source and a target.** Each one is an HA group or a
-DHCP host, by name. Not a subnet, and not an id — `--old-id` and `--new-id` take
-those. You never list the subnets: the script finds every subnet and range
-whose `dhcp_host` is `--old`, and points it at `--new`.
-
-Two sources, so two runs. Same target both times.
+`--old` and `--new` name a source and a target: an HA group or a DHCP host, by
+name, spelled as the portal spells it. A subnet name will not work, and neither
+will an id; `--old-id` and `--new-id` take ids. You never list the subnets. The
+script finds every subnet and range whose `dhcp_host` is `--old` and points it
+at `--new`. Two sources means two runs with the same target.
 
 ```
 export INFOBLOX_API_KEY='<your-key>'
@@ -116,24 +139,10 @@ To take part of a site rather than all of it, add `--subnet 10.20.30.0/24`,
 repeated per subnet, or `--space Corporate`. See
 [Choosing which subnets move](#choosing-which-subnets-move).
 
-**Consider not moving the old pair at all.** Edit `SITE-B-HA-OLD` in the portal,
-swap the dead host for the new one, rename it. Every subnet on it follows with no
-subnet edits. Then only the lone host needs a run. Which is less work depends on
-the counts, so read both dry runs first.
+### The API key
 
-No Python, or no API key? [CSV fallback](#csv-fallback) does the same job in the
-portal, on the same field.
-
-## Run the script
-
-<details>
-<summary>What you need, the key check, and the options</summary>
-
-- Python 3.7+, standard library only. Installing Python is out of scope; if you
-  cannot, use the CSV method.
-- Outbound HTTPS to `csp.infoblox.com`.
-- An API key with write access: Portal > your name > User Profile > API Keys.
-  Expired keys fail with `401`; make a new one rather than re-pasting.
+Make one at Portal > your name > User Profile > API Keys, with write access.
+Expired keys fail with `401`; make a new one rather than re-pasting.
 
 The export lives only in the shell that ran it. In a terminal window you export
 once, then run the script in that same window. Inside an agent or a CI step each
@@ -143,9 +152,8 @@ line often gets a fresh shell, so put both on one line:
 export INFOBLOX_API_KEY='<your-key>' && python3 move_ha_group.py --list-ha-groups
 ```
 
-### Is the key set?
-
-Ask the shell you are about to run in. This prints the length, never the key:
+To ask the shell you are about to run in whether the key is set (this prints
+the length, never the key):
 
 ```
 [ -n "$INFOBLOX_API_KEY" ] && echo "set, ${#INFOBLOX_API_KEY} characters" \
@@ -155,11 +163,8 @@ Ask the shell you are about to run in. This prints the length, never the key:
 `not set` means the export did not reach this shell. Export it again here.
 
 A set variable is not a working key. `--list-ha-groups` is the real test: it
-either lists your groups or fails with `401`. A `401` means the key is wrong or
-expired, so make a new one rather than re-pasting.
-
-The four runs, with real names on them, are in
-[The whole job](#the-whole-job).
+either lists your groups or fails with `401`, which means the key is wrong or
+expired.
 
 ### Options
 
@@ -172,14 +177,16 @@ The four runs, with real names on them, are in
 | `--verify` | Re-read afterwards; report anything left on the old group | `--verify` |
 | `--list-ha-groups` | Print every HA group with its id, then exit | `--list-ha-groups` |
 | `--list-hosts` | Print every DHCP host with its id, then exit | `--list-hosts` |
-| `--fix-ranges` | A separate job, not a move. See below | `--fix-ranges --old "<name>"` |
+| `--fix-ranges` | A separate job, not a move. See [Fix ranges that serve nothing](#fix-ranges-that-serve-nothing) | `--fix-ranges --old "<name>"` |
 | `--report` | Where to write the per-object CSV | `--report pilot.csv` |
 | `--old-id`, `--new-id` | A resource id instead of a name | `--old-id dhcp/ha_group/1a2b...` |
+
+Python 3.7+, standard library only.
 
 ### Choosing which subnets move
 
 Without a filter the run takes everything on the source. That is right when you
-are retiring a group. It is wrong for the commoner job of moving one site.
+are retiring a group and wrong for the commoner job of moving one site.
 
 ```
 --space "Corporate"                       one IP space
@@ -195,65 +202,59 @@ Narrowing happens before `--max`, so the cap counts what is left.
 Verified: a run with `--subnet` moved that subnet and its range and left the
 other subnet on the source untouched.
 
-### How `--max` counts
+### How the cap counts
 
-`--max` is the blast-radius control. Reach for it on the first run: move five,
-check them in the portal, then run again without it.
+`--max` is the blast-radius control. Use it on the first run: move five, check
+them in the portal, then run again without it.
 
-It counts objects, not subnets. A subnet is one object and each range is another.
-
-It takes whole units. A unit is a subnet with every range inside it, or a lone
-range whose parent subnet is not moving. It never splits a subnet from its
-ranges, so the count is approximate.
+It counts objects. A subnet is one object and each range is another. It takes
+whole units: a subnet with every range inside it, or a lone range whose parent
+subnet is not moving. It never splits a subnet from its ranges, so the count is
+approximate.
 
 Say the old group holds this, and you pass `--max 5`:
 
 | Unit | Objects | `--max 5` |
 |---|---|---|
-| Subnet A + 2 ranges | 3 | moves — 3 used |
-| Subnet B + 4 ranges | 5 | skipped — 3 + 5 is over 5 |
-| Subnet C, no ranges | 1 | moves — 4 used |
-| Lone range in a subnet staying put | 1 | moves — 5 used |
+| Subnet A + 2 ranges | 3 | moves, 3 used |
+| Subnet B + 4 ranges | 5 | skipped, 3 + 5 is over 5 |
+| Subnet C, no ranges | 1 | moves, 4 used |
+| Lone range in a subnet staying put | 1 | moves, 5 used |
 
-Five objects moved, out of ten. A skipped unit does not stop the run: the script
+Five objects moved, out of ten. A skipped unit does not stop the run; the script
 keeps going and takes later units that still fit.
 
-The first unit is the exception. It is always taken, even when it is bigger than
-N on its own. `--max 2` against a subnet with six ranges moves all seven objects.
+The first unit is always taken, even when it is bigger than N on its own.
+`--max 2` against a subnet with six ranges moves all seven objects.
 
 You do not choose which units. Run the dry run first and read the report to see
 what the next run would take.
 
 </details>
 
+## Worked examples
 
-## A worked example
+### Host or pair to a pair
 
 <details>
 <summary>A lone host, or one pair to another, step by step, with output</summary>
 
-
 Site A runs one DHCP host, `site-a-dhcp01`. A new pair, `SITE-AB-HA`, is built
 and ready. Every subnet and range on the host moves onto the pair.
 
-**Pair to pair is this same walkthrough.** Only the name after `--old` changes.
-The steps, the flags and the undo are identical, and
+Pair to pair is this same walkthrough. Only the name after `--old` changes, and
 [Group to group](#group-to-group) at the end shows the one line that differs.
 
-**`--old` and `--new` take a name.** An HA group or a DHCP host, either side, in
-any combination. Not a subnet, and not a subnet id. Spell it as the portal
-spells it.
+`--old` and `--new` take an HA group or a DHCP host, either side, in any
+combination. The script works out which kind it is. A name that exists as both
+is refused rather than guessed at; use `--old-id` and `--new-id` to settle
+that, or any time you would rather be exact.
 
-The script works out which kind it is. A name that exists as both is refused
-rather than guessed at. Use `--old-id` and `--new-id` to settle that, or any
-time you would rather be exact.
+By default you do not name the subnets. The script moves every subnet and every
+range whose `dhcp_host` is the source. `--space` and `--subnet` narrow that, and
+`--max` caps how many objects a run touches.
 
-**By default you do not name the subnets.** The script moves every subnet and
-every range whose `dhcp_host` is the source. `--space` and `--subnet` narrow
-that, and `--max` caps how many objects a run touches. See
-[Choosing which subnets move](#choosing-which-subnets-move).
-
-### 1. Get the exact names
+#### 1. Get the exact names
 
 Two lists, because groups and hosts live apart:
 
@@ -286,7 +287,7 @@ Copy the names from that output. Every object you move must sit in the target's
 IP space. The script checks each one before it writes, and the server refuses a
 mismatch anyway.
 
-### 2. Dry run
+#### 2. Dry run
 
 ```
 python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA"
@@ -314,19 +315,20 @@ A dry run sends no writes. It writes one local file, `ha-move-report.csv`, with
 a row per object. Read that file before step 3.
 
 Watch for a warning about ranges with no `dhcp_host`. Those are dark today and a
-move will not touch them. See [Fix ranges](#fix-ranges-that-serve-nothing).
+move will not touch them. See
+[Fix ranges that serve nothing](#fix-ranges-that-serve-nothing).
 
-### 3. Pilot five, then check
+#### 3. Pilot five, then check
 
 ```
 python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA" \
   --max 5 --apply --verify
 ```
 
-Open those five in the portal. The **Edit** dialog shows the assignment; the side
+Open those five in the portal. The Edit dialog shows the assignment; the side
 panel does not.
 
-### 4. The rest, then confirm
+#### 4. The rest, then confirm
 
 ```
 python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA" \
@@ -335,7 +337,7 @@ python3 move_ha_group.py --old "site-a-dhcp01" --new "SITE-AB-HA" \
 
 `--verify` re-reads afterwards and prints what is still on the source.
 
-### 5. Undo, if you need it
+#### 5. Undo, if you need it
 
 ```
 python3 move_ha_group.py --old "SITE-AB-HA" --new "site-a-dhcp01" \
@@ -343,13 +345,12 @@ python3 move_ha_group.py --old "SITE-AB-HA" --new "site-a-dhcp01" \
 ```
 
 Names swapped, and the host is now the target. Each run builds its plan from the
-current state, so this finds everything now on the pair.
+current state, so this finds everything now on the pair. That is not always the
+same set: anything else already on the pair comes back with yours. If the pair
+held objects before your move, add `--subnet` to name only what you moved, and
+read the dry run before applying.
 
-That is not always the same set. Anything else already on the pair comes back
-with yours. If the pair held objects before your move, add `--subnet` to name
-only what you moved, and read the dry run before applying.
-
-### Group to group
+#### Group to group
 
 Identical, with a group name on both sides:
 
@@ -357,31 +358,27 @@ Identical, with a group name on both sides:
 python3 move_ha_group.py --old "SITE-B-HA-OLD" --new "SITE-AB-HA" --apply --verify
 ```
 
-Everything above applies unchanged: the dry run, `--max`, `--verify`, and the
-swapped command to undo it.
+The dry run, `--max`, `--verify`, and the swapped command to undo it all apply
+unchanged.
 
-### Two sites at once
+#### Two sites at once
 
 One new pair, two sources: one run per source, the same target both times.
-Worked through at the top, in [The whole job](#the-whole-job).
+Worked through in [Quick start](#quick-start).
 
-### Different subnets to different groups
+#### Different subnets to different groups
 
 The script does one source and one target per run. For two targets, run it
 twice. It cannot send some subnets on one source one way and the rest another
-way.
-
-The CSV method can: `dhcp_host` is a per-row value, so one file can send row A
-to one group and row B to another. We have not tested a mixed file.
+way. The CSV method can, since `dhcp_host` is a per-row value, so one file can
+send row A to one group and row B to another. We have not tested a mixed file.
 
 </details>
 
-
-## Pair to one of its own hosts
+### Pair to one of its own hosts
 
 <details>
 <summary>Leaving HA: why the direct move fails, and the two orders that work</summary>
-
 
 Pair `SITE-C-HA` runs on `site-c-dhcp01` and `site-c-dhcp02`. The pair goes;
 `site-c-dhcp01` stays.
@@ -392,11 +389,18 @@ for Active/Active and Active/Passive groups, in
 So `--old "SITE-C-HA" --new "site-c-dhcp01"` passes the dry run and fails on
 `--apply` with `HTTP 400`. The range stays with its subnet.
 
-**A pair in use cannot be deleted.** Not in the docs. The lab got
+A pair in use cannot be deleted either. That is not in the docs; the lab got
 `Cannot delete this HA Group because it is serving a Subnet/Range in the IP Space: <space>`.
 
-Empty the pair, delete it, then assign the host. Deleting the group freed both
-hosts. Run on an Active/Active pair, one subnet and one range.
+So the order is: empty the pair, delete it, then assign the host. Deleting the
+group freed both hosts. Run on an Active/Active pair, one subnet and one range.
+
+```mermaid
+flowchart LR
+    S["Spare group in the same IP space: move onto it"] --> D
+    N["No spare: blank dhcp_host on ranges, then subnets"] --> D
+    D["Delete the pair"] --> H["Set the host on subnets, then ranges"]
+```
 
 With a spare group or host in the same IP space, `SPARE-HA` here:
 
@@ -421,18 +425,14 @@ Untested: leases at renewal, and emptying the field by CSV import.
 
 </details>
 
-
-## Fix ranges that serve nothing
+### Fix ranges that serve nothing
 
 <details>
 <summary>The warning, the fix, and the flag's rules</summary>
 
-
 A range hands out leases only when its own `dhcp_host` is set. An empty one
 serves nothing, and it does not inherit from its subnet. Nothing points those
 ranges at the source, so a move cannot see them and only warns.
-
-### How you find out
 
 Any move run tells you, dry run included:
 
@@ -444,10 +444,8 @@ Any move run tells you, dry run included:
              10.0.0.5-10.0.0.10
 ```
 
-Those two hand out no leases today. They did not break during the move. They
+Those two hand out no leases today. They did not break during the move; they
 were already dark.
-
-### Fixing them
 
 `--fix-ranges` gives each one the value its own parent subnet uses. Dry run
 first, as always:
@@ -484,8 +482,6 @@ Verifying ...
   Clean: every range inside those subnets now has a dhcp_host.
 ```
 
-### The flag
-
 | | |
 |---|---|
 | Takes | `--old` or `--old-id`, naming an HA group or a DHCP host |
@@ -498,102 +494,21 @@ Verifying ...
 | Undo | Set `dhcp_host` back to empty. Tested through the API, `null` or `""` |
 | Quiet | A run that finds nothing writes no report. It says so and stops |
 
-### Where it fits
-
-Run it before the move. The ranges then carry the old name, the move sees them,
+Run it before the move and the ranges carry the old name, so the move sees them
 and everything lands together. Run it after and they get the new name directly.
 Either order works.
 
-**It is a separate run, on purpose.** A move rewrites a field that already has a
-value. This fills a field that is empty. One run, one kind of undo.
+It is a separate run on purpose. A move rewrites a field that already has a
+value; this fills a field that is empty. One run, one kind of undo.
 
 </details>
-
-
-## What we found
-
-<details>
-<summary>Everything the lab tenant actually did</summary>
-
-
-- **A DHCP host works as the target too.** Every rollback wrote one: two subnets
-  and a range went from an HA group back onto a host, `HTTP 200` each, twice over.
-  So all four directions have been written, not only planned.
-- **An HA group holds exactly two hosts, always.** Sending one is refused with
-  `Expects two hosts in the group`, and `port` in the payload is refused as read
-  only. A host cannot be freed from a group; the group has to go first. See
-  [Pair to one of its own hosts](#pair-to-one-of-its-own-hosts).
-- **A DHCP host as the source works, both ways.** Run in a lab tenant with
-  `--apply`: two subnets and a range moved off a host onto an HA group, three
-  objects changed, none failed, and `--verify` came back clean. The swapped
-  command put all three back on the host. Two objects of the three were
-  pre-existing, not built for the test.
-- **A pair cannot hand its subnets straight to one of its own hosts.** Dry run
-  passed, `--apply` failed with `HTTP 400`. Matches
-  [Configuring High Availability](https://docs.infoblox.com/space/BloxOneDDI/186617244).
-- **An HA group in use cannot be deleted.** Refused with `Cannot delete this HA
-  Group because it is serving a Subnet/Range in the IP Space: <space>`. Empty, it
-  deleted and freed both hosts, and both routes in
-  [Pair to one of its own hosts](#pair-to-one-of-its-own-hosts) worked. Not in
-  the docs.
-- **A target reporting no IP space is decided by the server, not by us.** The
-  script says it is skipping its precheck and lets the writes go. One such group
-  took them. A newly built group in an earlier round refused them. So the skip
-  buys you the server's answer, per object, and nothing more.
-- **Not every DHCP host can serve a subnet.** A host has a `type`. Any type but
-  `nios_ddi` works. A `nios_ddi` host is refused on every write with
-  `Cannot assign host of type: NIOS DDI to Subnet object`. That tenant held 48
-  of those against 119 that work, which is also why `dhcp/host` outnumbers
-  `infra/host`. `--list-hosts` prints the type, and a `nios_ddi` target is now
-  refused before anything is written.
-- **A host already in an HA group cannot be a subnet's `dhcp_host`.** Refused on
-  create and on edit alike, with `The Host is already assigned to a HA Group`.
-  Point the subnet at the group instead, which works.
-- **`--fix-ranges` works.** Two ranges serving nothing were set to their parent
-  subnet's host, `set=2 failed=0`, and `--verify` came back clean. Both were then
-  put back as they were.
-- **A `dhcp_host` can be emptied through the API.** `null` and `""` both leave it
-  null, and setting it again restores it. So switching a range off is a real undo
-  for the line above. This is the API; the CSV import is still untested here.
-- **A partial run can be reversed.** Each run rebuilds its plan from the current
-  state, so after moving three of six objects with `--max` the swapped command
-  found exactly those three. That was a capped run, not an interruption or a real
-  error. If you do interrupt one, the report is still written, and a fresh dry run
-  shows where things actually stand.
-- **`--verify` reports what is left.** After a narrowed run it names the flag
-  that narrowed it and exits 0. After a run that asked for everything, anything
-  left is called out as unexpected and the exit code is 1. Objects the server
-  refused, and ranges held back with them, are reported as not moved rather
-  than as leftovers that appeared during the run.
-- **One HA group serves one IP space**, through its hosts, and the server enforces
-  it. A subnet from another space is refused with an error naming both spaces.
-- **A newly built group has nothing assigned yet** and so reports no IP space,
-  which is what makes the script skip its own check. In that round the server
-  still refused, so the skip cost a failed run, not a wrong one.
-- **The plan comes from a filtered query**, not a walk of the whole tenant, so it
-  returns quickly even on a large one. That filter is undocumented by Infoblox; if
-  it stops working the script says so and falls back to reading every subnet and
-  range, which takes minutes. That fallback covers a rejected filter, `400` or
-  `422`. Any other failure stops the run instead of quietly reading everything.
-- **Scale is untested.** Writes are throttled to about five a second, so a large
-  move is paced by that rather than by the API. Nothing bigger than six objects
-  has been run.
-- **Every object on a group is in one IP space**, so aiming at a group whose
-  hosts serve another space refuses outright rather than moving part of the set.
-  Inferred from one refusal, not stated by Infoblox.
-
-</details>
-
 
 ## CSV fallback
 
 <details>
 <summary>The portal route: export, edit one column, import</summary>
 
-
-### The column
-
-**Service Instance in the portal is `dhcp_host` in the CSV.** That one column
+Service Instance in the portal is `dhcp_host` in the CSV. That one column
 carries the assignment, and it is the only column to touch. It sits on two
 header rows, and you edit it on both:
 
@@ -603,53 +518,81 @@ HEADER-ipamdhcp-v3-range,key,space,start,end,...,dhcp_host,...
 ```
 
 The value is a name, spelled as the portal spells it: `SITE-AB-HA` for a pair,
-`site-a-dhcp01` for a lone host. Both kinds go in that same column, so a site on one
-host and a site on a pair are the same edit. A `nios_ddi` host is refused here
-too, by the same server rule.
-
-### The two files
+`site-a-dhcp01` for a lone host. Both kinds go in that same column, so a site on
+one host and a site on a pair are the same edit. A `nios_ddi` host is refused
+here too, by the same server rule.
 
 `move.csv` and `rollback.csv` are the same rows, twice. `rollback.csv` is the
 untouched copy, straight from the export. `move.csv` is the copy where you set
-`dhcp_host` to the new pair. One is the change, the other is the way back.
+`dhcp_host` to the new pair.
 
-**Not one file per source.** `dhcp_host` is a per-row value, so rows off a lone
-host and rows off an old pair go in the same `move.csv` and take the same new
-value. Rows could equally carry different values and send different subnets to
-different pairs, which is the one thing the script cannot do. We have not tested
-a mixed file.
+You do not need one file per source. `dhcp_host` is a per-row value, so rows off
+a lone host and rows off an old pair go in the same `move.csv` and take the same
+new value. Rows could equally carry different values and send different subnets
+to different pairs, which the script cannot do. We have not tested a mixed
+file.
 
-> **Import type must be "Add new records and update existing records."** Never one
-> with **"delete"** in the label: by their own wording those remove every object
-> missing from the imported file, and your file is trimmed. We did not test one,
-> for obvious reasons.
+> **Import type must be "Add new records and update existing records."** Never
+> one with "delete" in the label: by their own wording those remove every object
+> missing from the imported file, and your file is trimmed. We did not test one.
 
 | Step | Do this | Watch for |
 |---|---|---|
-| **1. Export** | Integrations > Data Import / Export > Export. Tick Subnets and Ranges, CSV, skip failed records | No filter: the object-types screen offers checkboxes per type and nothing to narrow by IP space or HA group, so you get the whole tenant. A previous export of this tenant took ~16 minutes per its job history; the two imports we timed took ~15 minutes each |
-| **2. Two files** | Copy the download to `rollback.csv` and trim it to the subnets you are moving **and their range rows**. Copy that to `move.csv` | Keep both `HEADER-` lines untouched. Rows you delete are never visited by an add-and-update import |
-| **3. Edit `move.csv`** | Set `dhcp_host` to the new group's name on every subnet **and** range row. Change nothing else | Do not blank the cell. We do not know what an empty value does on import and did not test it |
-| **4. Diff** | Compare `move.csv` against `rollback.csv` | Only `dhcp_host` should differ, only on data rows. Note your row counts |
-| **5. Import** | Import tab, pick `move.csv`, tick Subnets and Ranges, import type as above, skip failed records, Start | Another ~15 minutes |
-| **6. Check** | Counts match your row numbers, error log empty, spot-check one subnet and one range | Wait for **Import complete** first: an unreached type shows `0 of 0`, which looks like finding none. Use the **Edit** dialog — the side panel never showed HA group |
+| 1. Export | Integrations > Data Import / Export > Export. Tick Subnets and Ranges, CSV, skip failed records | No filter: the object-types screen offers checkboxes per type and nothing to narrow by IP space or HA group, so you get the whole tenant. A previous export of this tenant took ~16 minutes per its job history; the two imports we timed took ~15 minutes each |
+| 2. Two files | Copy the download to `rollback.csv` and trim it to the subnets you are moving and their range rows. Copy that to `move.csv` | Keep both `HEADER-` lines untouched. Rows you delete are never visited by an add-and-update import |
+| 3. Edit `move.csv` | Set `dhcp_host` to the new group's name on every subnet and range row. Change nothing else | Do not blank the cell. We do not know what an empty value does on import and did not test it |
+| 4. Diff | Compare `move.csv` against `rollback.csv` | Only `dhcp_host` should differ, only on data rows. Note your row counts |
+| 5. Import | Import tab, pick `move.csv`, tick Subnets and Ranges, import type as above, skip failed records, Start | Another ~15 minutes |
+| 6. Check | Counts match your row numbers, error log empty, spot-check one subnet and one range | Wait for Import complete first: an unreached type shows `0 of 0`, which looks like finding none. Use the Edit dialog; the side panel never showed HA group |
 
 Anything wrong: import `rollback.csv` the same way.
 
-`rollback.csv` restores **every column** of those rows as they were when you
+**`rollback.csv` restores every column of those rows** as they were when you
 exported, not just `dhcp_host`. If anyone changed anything else on those objects
 in the meantime, a rollback silently undoes it. Re-export first if that is a
 risk, or put `dhcp_host` back by hand.
 
 </details>
 
+## What we found
+
+<details>
+<summary>Everything the lab tenant actually did</summary>
+
+Server rules, as the lab met them:
+
+| Rule | What happened |
+|---|---|
+| An HA group holds exactly two hosts, always | Sending one is refused with `Expects two hosts in the group`, and `port` in the payload is refused as read only. A host cannot be freed from a group; the group has to go first |
+| A pair cannot hand its subnets straight to one of its own hosts | Dry run passed, `--apply` failed with `HTTP 400`. Matches [Configuring High Availability](https://docs.infoblox.com/space/BloxOneDDI/186617244) |
+| An HA group in use cannot be deleted | Refused with `Cannot delete this HA Group because it is serving a Subnet/Range in the IP Space: <space>`. Empty, it deleted and freed both hosts, and both routes in [Pair to one of its own hosts](#pair-to-one-of-its-own-hosts) worked. Not in the docs |
+| Not every DHCP host can serve a subnet | A host has a `type`. Any type but `nios_ddi` works. A `nios_ddi` host is refused on every write with `Cannot assign host of type: NIOS DDI to Subnet object`. That tenant held 48 of those against 119 that work, which is also why `dhcp/host` outnumbers `infra/host`. `--list-hosts` prints the type, and a `nios_ddi` target is refused before anything is written |
+| A host already in an HA group cannot be a subnet's `dhcp_host` | Refused on create and on edit alike, with `The Host is already assigned to a HA Group`. Point the subnet at the group instead, which works |
+| One HA group serves one IP space, through its hosts | The server enforces it. A subnet from another space is refused with an error naming both spaces |
+| Every object on a group is in one IP space | Aiming at a group whose hosts serve another space refuses the whole run instead of moving part of the set. Inferred from one refusal, not stated by Infoblox |
+| A target reporting no IP space is decided by the server | A newly built group has nothing assigned yet and so reports no IP space, which makes the script skip its own precheck and let the writes go. One such group took them. A newly built group in an earlier round refused them, so the skip cost a failed run, not a wrong one. The skip buys you the server's answer, per object, and nothing more |
+| A `dhcp_host` can be emptied through the API | `null` and `""` both leave it null, and setting it again restores it. So switching a range off is a real undo for `--fix-ranges`. This is the API; the CSV import is still untested here |
+
+What the script did:
+
+| Run | Result |
+|---|---|
+| A DHCP host as the source, both ways | With `--apply`, two subnets and a range moved off a host onto an HA group: three objects changed, none failed, `--verify` clean. The swapped command put all three back on the host. Two of the three were pre-existing, not built for the test |
+| A DHCP host as the target | Every rollback wrote one: two subnets and a range went from an HA group back onto a host, `HTTP 200` each, twice over. All four directions have been written, not only planned |
+| `--fix-ranges` | Two ranges serving nothing were set to their parent subnet's host, `set=2 failed=0`, and `--verify` came back clean. Both were then put back as they were |
+| Reversing a partial run | Each run rebuilds its plan from the current state, so after moving three of six objects with `--max` the swapped command found exactly those three. That was a capped run, with no interruption and no real error. If you do interrupt one, the report is still written, and a fresh dry run shows where things actually stand |
+| `--verify` | After a narrowed run it names the flag that narrowed it and exits 0. After a run that asked for everything, anything left is called out as unexpected and the exit code is 1. Objects the server refused, and ranges held back with them, are reported as not moved, separately from leftovers that appeared during the run |
+| Speed | The plan comes from a filtered query, so it returns quickly even on a large tenant. That filter is undocumented by Infoblox; if it stops working the script says so and falls back to reading every subnet and range, which takes minutes. The fallback covers a rejected filter, `400` or `422`. Any other failure stops the run instead of quietly reading everything |
+| Scale | Untested. Writes are throttled to about five a second, so a large move is paced by that rather than by the API. Nothing bigger than six objects has been run |
+
+</details>
 
 ## Not tested
 
 <details>
 <summary>What nobody here has run</summary>
 
-
-Either method past six objects. Live leases — there were no clients on the lab
+Either method past six objects. Live leases; there were no clients on the lab
 range. A real mid-run error; recovery from an artificial one works. Blanking a
 `dhcp_host` cell in a CSV. A delete-type import.
 
@@ -659,7 +602,4 @@ this tenant's export job history rather than from a run we timed.
 
 </details>
 
----
-
 Portal paths correct September 2026.
-
