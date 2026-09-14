@@ -383,74 +383,38 @@ to one group and row B to another. We have not tested a mixed file.
 <summary>Leaving HA: why the direct move fails, and the two orders that work</summary>
 
 
-A pair, `SITE-C-HA`, runs on `site-c-dhcp01` and `site-c-dhcp02`. The pair is
-going away, and `site-c-dhcp01` will serve everything on its own.
+Pair `SITE-C-HA` runs on `site-c-dhcp01` and `site-c-dhcp02`. The pair goes;
+`site-c-dhcp01` stays.
 
-**The direct move fails, and the dry run does not warn you.** A subnet cannot
-point at a host that is still in an HA group, so the server refuses the write:
+**A host in a pair cannot serve subnets of its own.** Infoblox documents this
+for Active/Active and Active/Passive groups, in
+[Configuring High Availability](https://docs.infoblox.com/space/BloxOneDDI/186617244).
+So `--old "SITE-C-HA" --new "site-c-dhcp01"` passes the dry run and fails on
+`--apply` with `HTTP 400`. The range stays with its subnet.
 
-```
-python3 move_ha_group.py --old "SITE-C-HA" --new "site-c-dhcp01" --apply --verify
-```
+**A pair in use cannot be deleted.** Not in the docs. The lab got
+`Cannot delete this HA Group because it is serving a Subnet/Range in the IP Space: <space>`.
 
-```
-  FAILED subnet 10.30.0.0/24: FAILED: HTTP 400 on PATCH https://csp.infoblox.com/api/ddi/v1/ipam/subnet/...
-  SKIPPED range 10.30.0.50-10.30.0.200: its subnet failed
+Empty the pair, delete it, then assign the host. Deleting the group freed both
+hosts. Run on an Active/Active pair, one subnet and one range.
 
-Applied. changed=0 failed=1 skipped=1
-
-Verifying ...
-  Still on the old HA group: 2 object(s) this run could not move (failed or skipped above).
-```
-
-The range stays with its subnet on the pair, so nothing is left split.
-
-**Deleting the pair first fails too.** The API refuses while anything still
-points at the group:
+With a spare group or host in the same IP space, `SPARE-HA` here:
 
 ```
-Cannot delete this HA Group because it is serving a Subnet/Range in the IP Space: Corporate.
-```
-
-So the order is fixed: empty the pair, delete it, then assign the host. Deleting
-the group frees both of its hosts. There are two ways to empty it, and both
-worked in the lab.
-
-### With a spare target: move twice
-
-This needs another HA group or DHCP host in the same IP space, `SPARE-HA` here.
-Every object has a server assigned throughout.
-
-```
-# 1. off the pair
 python3 move_ha_group.py --old "SITE-C-HA" --new "SPARE-HA" --apply --verify
-
-# 2. delete SITE-C-HA. Nothing points at it now, so the delete goes through
-
-# 3. onto the host
+# delete SITE-C-HA
 python3 move_ha_group.py --old "SPARE-HA" --new "site-c-dhcp01" --apply --verify
 ```
 
-Dry run steps 1 and 3 first, as always. If `SPARE-HA` already serves subnets of
-its own, step 3 takes those too, so add `--subnet` to name only yours.
+If `SPARE-HA` already serves subnets, add `--subnet` to the second run.
 
-### Without one: empty the field
+Without a spare, in a maintenance window: empty `dhcp_host` on every range, then
+every subnet, delete the group, then set the host on every subnet, then every
+range. Ranges must match their subnet, per the same page. The script does not
+empty a field or delete a group, so use the portal or the API. Run through the
+API only.
 
-Plan a maintenance window. From step 2 until step 4 these networks have no DHCP
-server.
-
-1. Export the subnets and ranges on the pair and keep the file as the record of
-   what they were.
-2. Set `dhcp_host` to empty on every range, then on every subnet.
-3. Delete `SITE-C-HA`.
-4. Set `dhcp_host` to `site-c-dhcp01` on every subnet, then on every range.
-
-The script does not empty a field or delete a group, so steps 2 to 4 happen in
-the portal, the API or a CSV import. The lab ran them through the API, where
-`null` empties the field. Emptying it by CSV import is untested.
-
-Try either way on one small subnet first. The lab subnet had no clients, so what
-devices do when they renew after the switch is unknown.
+Untested: leases at renewal, and emptying the field by CSV import.
 
 </details>
 
@@ -561,18 +525,14 @@ value. This fills a field that is empty. One run, one kind of undo.
   objects changed, none failed, and `--verify` came back clean. The swapped
   command put all three back on the host. Two objects of the three were
   pre-existing, not built for the test.
-- **A pair cannot hand its subnets straight to one of its own hosts.** The dry
-  run passed. `--apply` failed on the subnet with `HTTP 400` and held its range
-  back, so nothing was split.
+- **A pair cannot hand its subnets straight to one of its own hosts.** Dry run
+  passed, `--apply` failed with `HTTP 400`. Matches
+  [Configuring High Availability](https://docs.infoblox.com/space/BloxOneDDI/186617244).
 - **An HA group in use cannot be deleted.** Refused with `Cannot delete this HA
-  Group because it is serving a Subnet/Range in the IP Space: <space>`. Once
-  nothing pointed at it, the delete went through, and neither of its hosts was
-  left in any group.
-- **Both ways off a pair onto its own host worked.** Moving through a spare group
-  and then onto the host: `changed=2 failed=0` each run, `--verify` clean.
-  Emptying `dhcp_host` through the API, deleting the group and setting the host
-  worked as well. The lab pair was then rebuilt from the same two hosts and took
-  its subnet back.
+  Group because it is serving a Subnet/Range in the IP Space: <space>`. Empty, it
+  deleted and freed both hosts, and both routes in
+  [Pair to one of its own hosts](#pair-to-one-of-its-own-hosts) worked. Not in
+  the docs.
 - **A target reporting no IP space is decided by the server, not by us.** The
   script says it is skipping its precheck and lets the writes go. One such group
   took them. A newly built group in an earlier round refused them. So the skip
