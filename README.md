@@ -406,8 +406,10 @@ python3 move_ha_group.py --old "SITE-C-HA" --new "SPARE-HA" --apply --verify
 python3 move_ha_group.py --old "SPARE-HA" --new "site-c-dhcp01" --apply --verify
 ```
 
-Dry run both moves first: the same commands without `--apply --verify`. If
-`SPARE-HA` already serves subnets, add `--subnet` to the second run.
+Dry run each move just before applying it: the same command without
+`--apply --verify`. The second dry run only finds your subnets once the first
+move has put them on `SPARE-HA`. If `SPARE-HA` already serves subnets, add
+`--subnet` to the second run.
 
 Without a spare, in a maintenance window: empty `dhcp_host` on every range, then
 every subnet, delete the group, then set the host on every subnet, then every
