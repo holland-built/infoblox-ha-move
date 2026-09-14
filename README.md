@@ -22,6 +22,7 @@ host or HA group to another, with a script or through the portal's CSV import.
 [Read first](#read-first) · [The whole job](#the-whole-job) ·
 [Run the script](#run-the-script) ·
 [A worked example](#a-worked-example) ·
+[Pair to one of its own hosts](#pair-to-one-of-its-own-hosts) ·
 [Fix ranges](#fix-ranges-that-serve-nothing) ·
 [What we found](#what-we-found) · [CSV fallback](#csv-fallback) ·
 [Not tested](#not-tested)
@@ -376,6 +377,84 @@ to one group and row B to another. We have not tested a mixed file.
 </details>
 
 
+## Pair to one of its own hosts
+
+<details>
+<summary>Leaving HA: why the direct move fails, and the two orders that work</summary>
+
+
+A pair, `SITE-C-HA`, runs on `site-c-dhcp01` and `site-c-dhcp02`. The pair is
+going away, and `site-c-dhcp01` will serve everything on its own.
+
+**The direct move fails, and the dry run does not warn you.** A subnet cannot
+point at a host that is still in an HA group, so the server refuses the write:
+
+```
+python3 move_ha_group.py --old "SITE-C-HA" --new "site-c-dhcp01" --apply --verify
+```
+
+```
+  FAILED subnet 10.30.0.0/24: FAILED: HTTP 400 on PATCH https://csp.infoblox.com/api/ddi/v1/ipam/subnet/...
+  SKIPPED range 10.30.0.50-10.30.0.200: its subnet failed
+
+Applied. changed=0 failed=1 skipped=1
+
+Verifying ...
+  Still on the old HA group: 2 object(s) this run could not move (failed or skipped above).
+```
+
+The range stays with its subnet on the pair, so nothing is left split.
+
+**Deleting the pair first fails too.** The API refuses while anything still
+points at the group:
+
+```
+Cannot delete this HA Group because it is serving a Subnet/Range in the IP Space: Corporate.
+```
+
+So the order is fixed: empty the pair, delete it, then assign the host. Deleting
+the group frees both of its hosts. There are two ways to empty it, and both
+worked in the lab.
+
+### With a spare target: move twice
+
+This needs another HA group or DHCP host in the same IP space, `SPARE-HA` here.
+Every object has a server assigned throughout.
+
+```
+# 1. off the pair
+python3 move_ha_group.py --old "SITE-C-HA" --new "SPARE-HA" --apply --verify
+
+# 2. delete SITE-C-HA. Nothing points at it now, so the delete goes through
+
+# 3. onto the host
+python3 move_ha_group.py --old "SPARE-HA" --new "site-c-dhcp01" --apply --verify
+```
+
+Dry run steps 1 and 3 first, as always. If `SPARE-HA` already serves subnets of
+its own, step 3 takes those too, so add `--subnet` to name only yours.
+
+### Without one: empty the field
+
+Plan a maintenance window. From step 2 until step 4 these networks have no DHCP
+server.
+
+1. Export the subnets and ranges on the pair and keep the file as the record of
+   what they were.
+2. Set `dhcp_host` to empty on every range, then on every subnet.
+3. Delete `SITE-C-HA`.
+4. Set `dhcp_host` to `site-c-dhcp01` on every subnet, then on every range.
+
+The script does not empty a field or delete a group, so steps 2 to 4 happen in
+the portal, the API or a CSV import. The lab ran them through the API, where
+`null` empties the field. Emptying it by CSV import is untested.
+
+Try either way on one small subnet first. The lab subnet had no clients, so what
+devices do when they renew after the switch is unknown.
+
+</details>
+
+
 ## Fix ranges that serve nothing
 
 <details>
@@ -475,17 +554,25 @@ value. This fills a field that is empty. One run, one kind of undo.
   So all four directions have been written, not only planned.
 - **An HA group holds exactly two hosts, always.** Sending one is refused with
   `Expects two hosts in the group`, and `port` in the payload is refused as read
-  only. A host cannot be freed from a group; the group has to go first. That is
-  why moving onto a host means picking one that was never paired.
+  only. A host cannot be freed from a group; the group has to go first. See
+  [Pair to one of its own hosts](#pair-to-one-of-its-own-hosts).
 - **A DHCP host as the source works, both ways.** Run in a lab tenant with
   `--apply`: two subnets and a range moved off a host onto an HA group, three
   objects changed, none failed, and `--verify` came back clean. The swapped
   command put all three back on the host. Two objects of the three were
   pre-existing, not built for the test.
-- **A subnet cannot point at a host that is already in an HA group.** Creating
-  one is refused with `400 The Host is already assigned to a HA Group`. So once
-  a host joins a pair, the group name is the value that works, not the host
-  name. Seen on create; we did not try the same thing as an edit.
+- **A pair cannot hand its subnets straight to one of its own hosts.** The dry
+  run passed. `--apply` failed on the subnet with `HTTP 400` and held its range
+  back, so nothing was split.
+- **An HA group in use cannot be deleted.** Refused with `Cannot delete this HA
+  Group because it is serving a Subnet/Range in the IP Space: <space>`. Once
+  nothing pointed at it, the delete went through, and neither of its hosts was
+  left in any group.
+- **Both ways off a pair onto its own host worked.** Moving through a spare group
+  and then onto the host: `changed=2 failed=0` each run, `--verify` clean.
+  Emptying `dhcp_host` through the API, deleting the group and setting the host
+  worked as well. The lab pair was then rebuilt from the same two hosts and took
+  its subnet back.
 - **A target reporting no IP space is decided by the server, not by us.** The
   script says it is skipping its precheck and lets the writes go. One such group
   took them. A newly built group in an earlier round refused them. So the skip
@@ -513,7 +600,8 @@ value. This fills a field that is empty. One run, one kind of undo.
 - **`--verify` reports what is left.** After a narrowed run it names the flag
   that narrowed it and exits 0. After a run that asked for everything, anything
   left is called out as unexpected and the exit code is 1. Objects the server
-  refused are counted as failures, not as leftovers.
+  refused, and ranges held back with them, are reported as not moved rather
+  than as leftovers that appeared during the run.
 - **One HA group serves one IP space**, through its hosts, and the server enforces
   it. A subnet from another space is refused with an error naming both spaces.
 - **A newly built group has nothing assigned yet** and so reports no IP space,
