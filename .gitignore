@@ -19,3 +19,6 @@ test/
 
 # agent worktree scratch
 .orca/
+
+# personal Claude Code permissions
+.claude/settings.local.json

@@ -951,6 +951,17 @@ def main():
                           if str(row["result"]).startswith("HTTP"))
             still = [o for o in ls + lr if o.get("id") in written]
             unwritten = len(still)
+            # Objects this run selected but did not write are already printed
+            # as failed or skipped. They did not appear after the plan was
+            # built, so they stay out of the leftover counts below.
+            planned = set(row["id"] for row in rows)
+            held = [o for o in ls + lr
+                    if o.get("id") in planned and o.get("id") not in written]
+            ls = [o for o in ls if o.get("id") not in planned]
+            lr = [o for o in lr if o.get("id") not in planned]
+            if held:
+                print("  Still on the old %s: %d object(s) this run could not move "
+                      "(failed or skipped above)." % (old["kind"], len(held)))
             if unwritten:
                 print("  FAILED TO PERSIST: %d object(s) the server accepted are still"
                       % unwritten)
@@ -963,9 +974,10 @@ def main():
                 # "not selected" would hide it behind an exit code of 0.
                 narrowed = args.max is not None or args.space or args.subnet
                 if narrowed:
-                    print("  Everything this run selected has moved. %d subnets and %d "
-                          "ranges are still on the old group and were not selected "
-                          "(%s)." % (len(ls), len(lr), _why_narrowed(args)))
+                    print("  %s%d subnets and %d ranges are still on the old group and "
+                          "were not selected (%s)."
+                          % ("" if held else "Everything this run selected has moved. ",
+                             len(ls), len(lr), _why_narrowed(args)))
                 else:
                     print("  UNEXPECTED: nothing narrowed this run, yet %d subnets and"
                           % len(ls))
@@ -974,7 +986,7 @@ def main():
                     print("              appeared after the plan was built. Re-run "
                           "the dry run.")
                     unwritten = len(ls) + len(lr)
-            else:
+            elif not held:
                 print("  Clean: nothing still points at the old %s." % old["kind"])
 
         # Non-zero if a write failed, or if something we wrote did not stick.
