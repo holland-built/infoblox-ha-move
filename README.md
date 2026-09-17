@@ -107,7 +107,7 @@ python3 move_ha_group.py --old "SITE-AB-HA" --new "site-a-dhcp01" --apply --veri
 |---|---|
 | `move_ha_group.py` | The whole tool |
 | `README.md` | This page |
-| `ha-move-report.csv` | Written by a move or fix run that finds something, one row per object. Ignored by git |
+| `ha-move-report.csv` | The plan, one row per object. Written once a run has found something and passed its checks. Ignored by git |
 
 <details>
 <summary><b>Read first: the one field this changes</b></summary>
