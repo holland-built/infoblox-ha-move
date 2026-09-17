@@ -3,6 +3,7 @@
 [![Python 3.7+](https://img.shields.io/badge/python-3.7%2B-blue)](https://www.python.org/)
 [![Standard library only](https://img.shields.io/badge/dependencies-none-brightgreen)](#)
 [![Infoblox Universal DDI](https://img.shields.io/badge/Infoblox-Universal%20DDI-orange)](https://csp.infoblox.com/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Dry run by default](https://img.shields.io/badge/default-dry%20run-lightgrey)](#)
 
 Move subnets and their DHCP ranges from one DHCP host or HA group to another
@@ -107,6 +108,7 @@ python3 move_ha_group.py --old "SITE-AB-HA" --new "site-a-dhcp01" --apply --veri
 |---|---|
 | `move_ha_group.py` | The whole tool |
 | `README.md` | This page |
+| `LICENSE` | MIT license |
 | `ha-move-report.csv` | The plan, one row per object. Written once a run has found something and passed its checks. Ignored by git |
 
 <details>
@@ -136,7 +138,7 @@ Use the name. The API calls groups `dhcp/ha_group/<uuid>` and hosts
 `--new-id`, but the CSV column takes the name.
 
 `dhcp/host` is a different list from the appliances under `infra/host`. In one
-lab tenant it held 167 rows against 101 there. Read the DHCP list.
+lab tenant it held many more rows. Read the DHCP list.
 
 </details>
 
@@ -583,7 +585,7 @@ Server rules, as the lab met them:
 | An HA group holds exactly two hosts, always | Sending one is refused with `Expects two hosts in the group`, and `port` in the payload is refused as read only. A host cannot be freed from a group; the group has to go first |
 | A pair cannot hand its subnets straight to one of its own hosts | Dry run passed, `--apply` failed with `HTTP 400`. Matches [Configuring High Availability](https://docs.infoblox.com/space/BloxOneDDI/186617244) |
 | An HA group in use cannot be deleted | Refused with `Cannot delete this HA Group because it is serving a Subnet/Range in the IP Space: <space>`. Empty, it deleted and freed both hosts, and both routes in Pair to one of its own hosts worked. Not in the docs |
-| Not every DHCP host can serve a subnet | A host has a `type`. Any type but `nios_ddi` works. A `nios_ddi` host is refused on every write with `Cannot assign host of type: NIOS DDI to Subnet object`. That tenant held 48 of those against 119 that work, which is also why `dhcp/host` outnumbers `infra/host`. `--list-hosts` prints the type, and a `nios_ddi` target is refused before anything is written |
+| Not every DHCP host can serve a subnet | A host has a `type`. Any type but `nios_ddi` works. A `nios_ddi` host is refused on every write with `Cannot assign host of type: NIOS DDI to Subnet object`. That tenant held a good number of them, which is also why `dhcp/host` outnumbers `infra/host`. `--list-hosts` prints the type, and a `nios_ddi` target is refused before anything is written |
 | A host already in an HA group cannot be a subnet's `dhcp_host` | Refused on create and on edit alike, with `The Host is already assigned to a HA Group`. Point the subnet at the group instead, which works |
 | One HA group serves one IP space, through its hosts | The server enforces it. A subnet from another space is refused with an error naming both spaces |
 | Every object on a group is in one IP space | Aiming at a group whose hosts serve another space refuses the whole run instead of moving part of the set. Inferred from one refusal, not stated by Infoblox |

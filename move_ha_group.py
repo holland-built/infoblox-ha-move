@@ -147,8 +147,8 @@ HOST_FIELDS = "id,name,ip_space,type"
 #
 # "DHCP host" is Infoblox's own word for the dhcp/host collection, and it is not
 # the same list as the appliances under infra/host. In one lab tenant dhcp/host
-# held 167 rows against 101 there, so do not treat either as a subset of the
-# other.
+# held many more rows than infra/host, so do not treat either as a subset of
+# the other.
 COLLECTIONS = (
     ("dhcp/ha_group", "HA group", HA_FIELDS),
     ("dhcp/host", "DHCP host", HOST_FIELDS),
